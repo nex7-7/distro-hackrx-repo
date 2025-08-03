@@ -1,0 +1,6 @@
+pymupdf4llm
+pydantic
+python-dotenv
+PDFPlumber
+pillow
+pytesseract

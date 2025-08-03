@@ -1,0 +1,43 @@
+# Ignore all log files
+*.log
+
+# Ignore the 'build' directory
+build/
+
+# Ignore temporary files
+temp/*
+
+# Ignore specific IDE files
+.DS_Store
+.idea/
+
+# Ignore Github Files
+.github
+
+# Ignore Environment Files
+.env
+.env.local
+
+# Ignore Python Virtual Environments
+.venv
+
+# Data directories - keep structure but ignore large files
+data/chunked/*.md
+data/chunked/*.json
+
+# Database files
+db/*
+!db/.gitkeep
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Notebook Folder
+notebooks
