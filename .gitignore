@@ -22,8 +22,8 @@ temp/*
 .venv
 
 # Data directories - keep structure but ignore large files
-data/chunked/*.md
-data/chunked/*.json
+# data/chunked/*.md (Commented out for now)
+# data/chunked/*.json
 
 # Database files
 db/*
