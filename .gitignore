@@ -28,6 +28,7 @@ temp/*
 # Database files
 db/*
 !db/.gitkeep
+chroma_db
 
 # Notebook checkpoints
 .ipynb_checkpoints/

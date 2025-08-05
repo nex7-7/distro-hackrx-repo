@@ -1,6 +1,8 @@
 pymupdf4llm
 pydantic
 python-dotenv
-PDFPlumber
+pdfplumber
 pillow
 pytesseract
+chromadb
+sentence-transformers

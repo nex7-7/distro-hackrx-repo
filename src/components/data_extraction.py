@@ -521,9 +521,9 @@ class PageWiseChunker:
 
 
 # ===== MAIN PIPELINE CLASS =====
-class DocumentIngestionPipeline:
+class DocumentExtractionPipeline:
     """
-    Main document ingestion pipeline with robust dual extraction.
+    Main document extraction pipeline with robust dual extraction.
 
     Orchestrates the entire process from PDF extraction to chunk creation,
     following the Open/Closed Principle for easy extension.
@@ -726,7 +726,7 @@ def estimate_processing_time(pdf_path: Path) -> float:
 
 # Make classes available for import
 __all__ = [
-    "DocumentIngestionPipeline",
+    "DocumentExtractionPipeline",
     "ChunkingConfig",
     "DualPDFExtractor",
     "PageWiseChunker",
