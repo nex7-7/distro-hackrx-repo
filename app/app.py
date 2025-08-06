@@ -1,3 +1,4 @@
+
 import os
 import traceback
 import time
@@ -17,6 +18,38 @@ LLMSHERPA_API_URL = os.environ.get("LLMSHERPA_API_URL", "http://localhost:5001")
 WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://localhost:8080")
 HUGGING_FACE_MODEL_NAME = "BAAI/bge-base-en-v1.5"
 
+
+# --- Query Endpoint ---
+
+@app.route('/query', methods=['POST'])
+def query_chunks():
+    """
+    Accepts a JSON body with a 'query' field, embeds it, and returns the top 4 most similar chunks from Weaviate.
+    """
+    if not client or not client.is_ready():
+        return jsonify({"error": "Weaviate service is not available or not ready"}), 503
+
+    data = request.get_json()
+    if not data or 'query' not in data:
+        return jsonify({"error": "Missing 'query' in request body."}), 400
+    query_text = data['query']
+
+    # Generate embedding for the query
+    query_vec = get_embedding(query_text)
+
+    # Query Weaviate for top 4 most similar chunks
+    try:
+        result = client.query.get("Chunk", ["tag", "text", "source_file"]).with_near_vector({"vector": query_vec}).with_limit(4).do()
+        top_chunks = result.get('data', {}).get('Get', {}).get('Chunk', [])
+        return jsonify({
+            "query": query_text,
+            "results": top_chunks
+        })
+    except Exception as e:
+        print(f"Error querying Weaviate: {e}")
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+    
 # --- Global Variables & Initialization (Run once on startup) ---
 
 # 1. Initialize llmsherpa reader
