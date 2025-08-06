@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PDF Data Extractor</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 40px;
+      background-color: #f8f9fa;
+    }
+
+    h1 {
+      color: #343a40;
+    }
+
+    .upload-form {
+      margin-bottom: 30px;
+    }
+
+    .response-box {
+      background: #ffffff;
+      border: 1px solid #dee2e6;
+      padding: 20px;
+      max-height: 500px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      box-shadow: 0 0 10px rgba(0, 0, 0, 0.05);
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Upload a PDF to Extract Data</h1>
+
+  <form class="upload-form" id="uploadForm" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".pdf" required>
+    <button type="submit">Upload & Extract</button>
+  </form>
+
+
+  <h3>Extracted Data:</h3>
+  <div class="response-box" id="resultBox">No data extracted yet.</div>
+
+  <hr>
+  <h1>Query Extracted Chunks</h1>
+  <form id="queryForm">
+    <input type="text" id="queryInput" placeholder="Enter your query..." required style="width: 60%;">
+    <button type="submit">Search</button>
+  </form>
+  <h3>Query Results:</h3>
+  <div class="response-box" id="queryResultBox">No query made yet.</div>
+
+  <script>
+    const form = document.getElementById('uploadForm');
+    const resultBox = document.getElementById('resultBox');
+    const queryForm = document.getElementById('queryForm');
+    const queryInput = document.getElementById('queryInput');
+    const queryResultBox = document.getElementById('queryResultBox');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const formData = new FormData(form);
+      try {
+        const response = await fetch('/extract_data', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await response.json();
+        if (response.ok) {
+          if (data.data.length === 0) {
+            resultBox.textContent = "No text chunks found in the PDF.";
+          } else {
+            resultBox.textContent = data.data.map(chunk => `[${chunk.tag}]\n${chunk.text}\n`).join('\n');
+          }
+        } else {
+          resultBox.textContent = `Error: ${data.error}`;
+        }
+      } catch (error) {
+        resultBox.textContent = `Error: ${error.message}`;
+      }
+    });
+
+    queryForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const query = queryInput.value.trim();
+      if (!query) return;
+      queryResultBox.textContent = 'Searching...';
+      try {
+        const response = await fetch('/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query })
+        });
+        const data = await response.json();
+        if (response.ok) {
+          if (!data.results || data.results.length === 0) {
+            queryResultBox.textContent = 'No results found.';
+          } else {
+            queryResultBox.textContent = data.results.map(
+              (chunk, i) => `#${i+1} [${chunk.tag}]\n${chunk.text}\n`
+            ).join('\n');
+          }
+        } else {
+          queryResultBox.textContent = `Error: ${data.error}`;
+        }
+      } catch (error) {
+        queryResultBox.textContent = `Error: ${error.message}`;
+      }
+    });
+  </script>
+
+</body>
+</html>

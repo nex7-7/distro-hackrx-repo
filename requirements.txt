@@ -1,8 +1,10 @@
-pymupdf4llm
-pydantic
-python-dotenv
-pdfplumber
-pillow
-pytesseract
-chromadb
-sentence-transformers
+# For Hugging Face embeddings and Weaviate
+transformers==4.41.2
+torch==2.3.0
+weaviate-client==4.5.4
+flask
+requests
+llmsherpa
+transformers
+torch
+weaviate-client
