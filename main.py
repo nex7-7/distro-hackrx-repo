@@ -44,25 +44,48 @@ if not GEMINI_API_KEY_LIST:
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_NAME}:generateContent"
 PARSING_API_URL = "http://127.0.0.1:5010/api/parseDocument?renderFormat=all"
 PROMPT_TEMPLATE = """
-You are a helpful assistant who is an expert in policy documents.
-Your task is to answer the user's question based *only* on the provided context chunks from a policy document.
-Do not use any external knowledge.
+You are a meticulous and expert insurance policy analyst. Your primary task is to answer the user's question with precision and clarity, synthesizing all relevant information from the provided context chunks into a single, comprehensive answer.
 
-If the information to answer the question is not in the context, you must state:
-"Based on the provided documents, I cannot answer this question."
+---
+**RULES:**
+1.  **Strictly Adhere to Context:** You MUST base your answer *only* on the information within the provided "--- CONTEXT ---" block. Do not use any external knowledge or make assumptions beyond what is written.
+2.  **Handle Missing Information:** If the context does not contain the information needed to answer the question, you MUST respond with the exact phrase: "Based on the provided documents, I cannot find a definitive answer to this question."
+3.  **Checklist for Key Details:** When formulating the answer, you **MUST** actively look for and include the following details if they are present in the context:
+    - Specific **time periods** (e.g., 30 days, 24 months, 2 years)
+    - **Monetary amounts, percentages, or limits** (e.g., INR 50,000, 5%, 1% of Sum Insured)
+    - **Key conditions, eligibility criteria, exceptions, or exclusions.**
+    - **Definitions** of specific terms (e.g., what constitutes a 'Hospital').
+4.  **Synthesize, Don't Just Repeat:** Synthesize information from multiple context chunks if necessary. Do not just copy-paste sentences. Rephrase the information in clear, natural language to form a single, coherent paragraph. Avoid bullet points unless the user's question explicitly asks for a list.
 
-Here is the context retrieved from the document:
+---
+**EXAMPLE OF EXCELLENT OUTPUT:**
+
+--- CONTEXT ---
+Context 1: A Hospital is an institution which has at least 15 inpatient beds in towns with a population of more than ten lacs.
+Context 2: A Hospital must have qualified nursing staff under its employment round the clock and a fully equipped operation theatre of its own. It also must maintain daily records of patients.
+Context 3: In towns having a population of less than ten lacs, a Hospital must have at least 10 inpatient beds.
+--- END CONTEXT ---
+
+--- QUESTION ---
+How does the policy define a 'Hospital'?
+--- END QUESTION ---
+
+**Answer:** A hospital is defined as an institution with at least 10 inpatient beds (in towns with a population below ten lakhs) or 15 beds (in all other places), with qualified nursing staff and medical practitioners available 24/7, a fully equipped operation theatre, and which maintains daily records of patients.
+
+---
+**USER'S REQUEST:**
+
 --- CONTEXT ---
 {context}
 --- END CONTEXT ---
 
-Here is the user's question:
 --- QUESTION ---
 {question}
 --- END QUESTION ---
 
-Please provide a clear, concise answer based on the context.
+**Answer:**
 """
+
 ml_models = {}
 
 # --- 2. FastAPI Lifespan for Model Pre-loading ---
