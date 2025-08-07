@@ -4,7 +4,7 @@ import uuid
 import asyncio
 import random
 import json  # --- Added for pretty printing JSON ---
-from typing import List
+from typing import List, Dict, Any
 from contextlib import asynccontextmanager
 
 import weaviate
@@ -22,6 +22,16 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import uvicorn
 from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
+
+# Import custom logger module
+from logger import (
+    logger, 
+    setup_file_logging, 
+    log_api_request, 
+    log_api_response, 
+    log_error, 
+    log_service_event
+)
 
 # --- 1. Configuration ---
 load_dotenv()
@@ -45,49 +55,36 @@ GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMI
 PARSING_API_URL = "http://127.0.0.1:5010/api/parseDocument?renderFormat=all"
 
 PROMPT_TEMPLATE = """
-You are a meticulous and expert insurance policy analyst. Your primary task is to answer the user's question with precision and clarity, synthesizing all relevant information from the provided context chunks into a single, comprehensive answer.
+You are a meticulous document analyst. Your task is to answer the user’s question with precision and clarity, using only the information in the provided CONTEXT block.
 
 ---
-**RULES:**
-1.  **Strictly Adhere to Context:** You MUST base your answer *only* on the information within the provided "--- CONTEXT ---" block. Do not use any external knowledge or make assumptions beyond what is written.
-2.  **Handle Missing Information:** If the context does not contain the information needed to answer the question, you MUST respond with the exact phrase: "Based on the provided documents, I cannot find a definitive answer to this question."
-3.  **Checklist for Key Details:** When formulating the answer, you **MUST** actively look for and include the following details if they are present in the context:
-    - Specific **time periods** (e.g., 30 days, 24 months, 2 years)
-    - **Monetary amounts, percentages, or limits** (e.g., INR 50,000, 5%, 1% of Sum Insured)
-    - **Key conditions, eligibility criteria, exceptions, or exclusions.**
-    - **Definitions** of specific terms (e.g., what constitutes a 'Hospital').
-4.  **Synthesize a Complete Narrative:** Synthesize information from multiple context chunks if necessary. Your goal is to provide a complete answer as if you have read the entire document, even if the context is fragmented. **Avoid overly terse or fragmented responses; the answer should always be a complete, standalone sentence or paragraph.**
-5.  **Acknowledge Incompleteness:** If you can answer part of a question but not all of it based on the context (e.g., you find the room rent limit but not the ICU limit), answer what you can and **clearly state which specific part of the question could not be answered from the provided text.**
+RULES:
+1. Base your answer exclusively on the information within the “--- CONTEXT ---” block. Do not use any external knowledge or assumptions.
+2. If the context does not contain the answer, reply exactly: “Based on the provided documents, I cannot find a definitive answer to this question.”
+3. When present in the context, include specific data points such as dates, durations, quantities, monetary amounts, percentages, definitions, conditions, eligibility criteria, exceptions, or exclusions.
+4. Synthesize a single, standalone paragraph without line breaks or tabs. Keep it concise and self-contained.
+5. If you can only answer part of the question, state what you can answer and specify which part is unresolved due to missing context.
 
 ---
-**EXAMPLE OF EXCELLENT OUTPUT:**
-
+Example:
 --- CONTEXT ---
-Context 1: A Hospital is an institution which has at least 15 inpatient beds in towns with a population of more than ten lacs.
-Context 2: A Hospital must have qualified nursing staff under its employment round the clock and a fully equipped operation theatre of its own. It also must maintain daily records of patients.
-Context 3: In towns having a population of less than ten lacs, a Hospital must have at least 10 inpatient beds.
+Context 1: A Hospital is an institution with at least 15 inpatient beds in towns with a population over one million.
+Context 2: It must maintain qualified nursing staff 24/7 and daily patient records.
 --- END CONTEXT ---
-
 --- QUESTION ---
-How does the policy define a 'Hospital'?
+How is “Hospital” defined?
 --- END QUESTION ---
-
-**Answer:** A hospital is defined as an institution with at least 10 inpatient beds (in towns with a population below ten lakhs) or 15 beds (in all other places), with qualified nursing staff and medical practitioners available 24/7, a fully equipped operation theatre, and which maintains daily records of patients.
+**Answer:** A Hospital is defined as an institution with at least 15 inpatient beds in towns with over one million residents, qualified nursing staff available 24/7, and daily patient record maintenance.
 
 ---
-**USER'S REQUEST:**
-
 --- CONTEXT ---
 {context}
 --- END CONTEXT ---
-
 --- QUESTION ---
 {question}
 --- END QUESTION ---
-
 **Answer:**
 """
-
 
 ml_models = {}
 
@@ -97,12 +94,21 @@ ml_models = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Application starting up...")
+    # Set up file logging at application startup
+    setup_file_logging()
+    log_service_event("startup", "Application starting up")
+    
     print(f"🤖 Loading embedding model '{MODEL_NAME}'...")
+    log_service_event("model_loading", f"Loading embedding model: {MODEL_NAME}")
     ml_models['embedding_model'] = SentenceTransformer(
         MODEL_NAME, device='cpu', cache_folder=CACHE_DIR)
     print("✅ Embedding model loaded.")
+    log_service_event("model_loaded", f"Embedding model loaded: {MODEL_NAME}")
+    
     yield
+    
     print("👋 Application shutting down...")
+    log_service_event("shutdown", "Application shutting down")
     ml_models.clear()
 
 app = FastAPI(
@@ -132,8 +138,8 @@ class Answer(BaseModel):
 
 class QueryResponse(BaseModel):
     answers: List[str]
-    results: List[Answer] = None
-    processing_time_seconds: float = None
+    # results: List[Answer] = None
+    # processing_time_seconds: float = None
 
 # --- 3. Core Logic Functions ---
 
@@ -149,8 +155,18 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
     return credentials.credentials
 
 async def connect_to_weaviate() -> weaviate.WeaviateClient:
-    """Connects to Weaviate with a retry mechanism."""
+    """
+    Connects to Weaviate with a retry mechanism.
+    
+    Returns:
+        weaviate.WeaviateClient: An initialized Weaviate client.
+        
+    Raises:
+        ConnectionError: If unable to connect to Weaviate after retries.
+    """
     print(f"\n🔗 Connecting to Weaviate at {WEAVIATE_HOST}:{WEAVIATE_PORT}...")
+    log_service_event("connection_attempt", f"Connecting to Weaviate at {WEAVIATE_HOST}:{WEAVIATE_PORT}")
+    
     for i in range(5):  # 5 retries
         try:
             client = weaviate.connect_to_local(
@@ -160,54 +176,115 @@ async def connect_to_weaviate() -> weaviate.WeaviateClient:
             )
             if client.is_ready():
                 print("✅ Weaviate is ready!")
+                log_service_event("connection_success", "Weaviate connection established")
                 return client
             client.close()
             await asyncio.sleep(3)
         except Exception as e:
-            print(
-                f"⏳ Weaviate not ready, retrying... (Attempt {i+1}/5). Error: {e}")
+            error_msg = f"⏳ Weaviate not ready, retrying... (Attempt {i+1}/5). Error: {e}"
+            print(error_msg)
+            log_error("Weaviate connection failed", {"attempt": i+1, "error": str(e)})
             await asyncio.sleep(3)
-    raise ConnectionError(
-        "❌ Could not connect to Weaviate after multiple retries.")
+    
+    error_msg = "❌ Could not connect to Weaviate after multiple retries."
+    log_error("Weaviate connection failed permanently")
+    raise ConnectionError(error_msg)
 
 
 async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
-    """Downloads a PDF and sends it to a parsing API to get text chunks."""
+    """
+    Downloads a PDF and sends it to a parsing API to get text chunks.
+    
+    Parameters:
+        api_url (str): URL of the parsing API.
+        file_url (str): URL of the PDF file to download.
+        
+    Returns:
+        List[str]: List of text chunks extracted from the PDF.
+        
+    Raises:
+        HTTPException: If download fails, parsing fails, or no text chunks are found.
+    """
     print(f"\n⬇️  Downloading file from: {file_url}")
+    log_service_event("download_start", f"Downloading document", {"url": file_url})
+    
     try:
         pdf_response = requests.get(file_url)
         pdf_response.raise_for_status()
+        log_service_event("download_complete", f"Document downloaded successfully", {"size_bytes": len(pdf_response.content)})
     except requests.RequestException as e:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to download document from URL: {e}")
+        error_msg = f"Failed to download document from URL: {e}"
+        log_error("document_download_failed", {"url": file_url, "error": str(e)})
+        raise HTTPException(status_code=400, detail=error_msg)
 
     filename = os.path.basename(urlparse(file_url).path)
     encoder = MultipartEncoder(
         fields={'file': (filename, pdf_response.content, 'application/pdf')})
 
     print(f"➡️  Sending '{filename}' to parsing API at {api_url}...")
+    log_service_event("parsing_start", f"Sending document to parsing API", {"filename": filename, "api": api_url})
+    
     try:
         response = requests.post(api_url, data=encoder, headers={
                                  'Content-Type': encoder.content_type})
         response.raise_for_status()
+        log_service_event("parsing_response_received", "Received response from parsing API", {"status_code": response.status_code})
     except requests.RequestException as e:
-        raise HTTPException(
-            status_code=503, detail=f"Document parsing service failed: {e}")
+        error_msg = f"Document parsing service failed: {e}"
+        log_error("parsing_failed", {"api": api_url, "error": str(e)})
+        raise HTTPException(status_code=503, detail=error_msg)
 
-    blocks = response.json().get('return_dict', {}).get('result', {}).get('blocks', [])
+    # Log parsed response structure (without full content)
+    response_json = response.json()
+    log_service_event("parsing_result_structure", "Structure of parsing result", {
+        "has_return_dict": "return_dict" in response_json,
+        "has_result": "result" in response_json.get("return_dict", {}),
+        "has_blocks": "blocks" in response_json.get("return_dict", {}).get("result", {})
+    })
+    
+    blocks = response_json.get('return_dict', {}).get('result', {}).get('blocks', [])
     if not blocks:
-        raise HTTPException(
-            status_code=422, detail="No text chunks were found in the parsed document.")
+        error_msg = "No text chunks were found in the parsed document."
+        log_error("no_text_chunks", {"filename": filename})
+        raise HTTPException(status_code=422, detail=error_msg)
 
     chunk_texts = [" ".join(block.get('sentences', [])) for block in blocks]
     print(f"✅ Parsed document into {len(chunk_texts)} text chunks.")
+    log_service_event("parsing_complete", f"Document parsed successfully", {
+        "chunks_count": len(chunk_texts),
+        "avg_chunk_length": sum(len(chunk) for chunk in chunk_texts) / len(chunk_texts) if chunk_texts else 0
+    })
     return chunk_texts
 
 
 async def ingest_to_weaviate(client: weaviate.WeaviateClient, collection_name: str, chunks: List[str]):
+    """
+    Generate embeddings for text chunks and ingest them into Weaviate.
+    
+    Parameters:
+        client (weaviate.WeaviateClient): The Weaviate client.
+        collection_name (str): Name of the collection to create.
+        chunks (List[str]): List of text chunks to embed and ingest.
+    """
+    ingest_start_time = time.time()
+    
+    # Generate embeddings
     model = ml_models['embedding_model']
     print(f"\n🧠 Generating embeddings for {len(chunks)} chunks...")
+    log_service_event("embedding_generation_start", "Starting chunk embedding generation", {
+        "chunks_count": len(chunks),
+        "collection_name": collection_name
+    })
+    
     embeddings = model.encode(chunks, show_progress_bar=True)
+    embedding_time = time.time() - ingest_start_time
+    
+    # Log embedding generation statistics
+    log_service_event("embedding_generation_complete", "Completed chunk embedding generation", {
+        "chunks_count": len(chunks),
+        "embedding_dimension": embeddings.shape[1],
+        "time_seconds": embedding_time
+    })
 
     # --- DEBUG PRINT 1: EMBEDDINGS RECEIVED ---
     print("\n" + "="*50)
@@ -217,16 +294,32 @@ async def ingest_to_weaviate(client: weaviate.WeaviateClient, collection_name: s
     print("="*50 + "\n")
     # ----------------------------------------
 
+    # Create collection
+    collection_start_time = time.time()
     if client.collections.exists(collection_name):
         client.collections.delete(collection_name)
+        log_service_event("collection_deleted", f"Deleted existing collection: {collection_name}")
+    
     client.collections.create(
         name=collection_name,
         vectorizer_config=wvc.Configure.Vectorizer.none(),
         properties=[wvc.Property(name="content", data_type=wvc.DataType.TEXT)]
     )
     print(f"✅ Created Weaviate collection: '{collection_name}'")
+    log_service_event("collection_created", f"Created Weaviate collection", {
+        "collection_name": collection_name,
+        "time_seconds": time.time() - collection_start_time
+    })
+    
+    # Ingest data
+    ingest_start_time = time.time()
     policy_collection = client.collections.get(collection_name)
     print(f"🚀 Pushing {len(chunks)} objects to Weaviate...")
+    log_service_event("batch_insertion_start", "Starting batch insertion to Weaviate", {
+        "objects_count": len(chunks),
+        "collection_name": collection_name
+    })
+    
     with policy_collection.batch.dynamic() as batch:
         for i, text in enumerate(tqdm(chunks, desc="Batching objects")):
             batch.add_object(
@@ -234,16 +327,46 @@ async def ingest_to_weaviate(client: weaviate.WeaviateClient, collection_name: s
                 uuid=uuid.uuid4(),
                 vector=embeddings[i].tolist()
             )
-    if len(policy_collection.batch.failed_objects) > 0:
-        print(
-            f"⚠️ Failed to push {len(policy_collection.batch.failed_objects)} objects.")
+            
+    failed_count = len(policy_collection.batch.failed_objects)
+    if failed_count > 0:
+        print(f"⚠️ Failed to push {failed_count} objects.")
+        log_error("batch_insertion_failures", {
+            "failed_objects_count": failed_count,
+            "collection_name": collection_name
+        })
+    
+    ingest_time = time.time() - ingest_start_time
     print(f"✅ Pushed {len(chunks)} objects to Weaviate successfully.")
+    log_service_event("batch_insertion_complete", "Completed batch insertion to Weaviate", {
+        "successful_objects_count": len(chunks) - failed_count,
+        "failed_objects_count": failed_count,
+        "collection_name": collection_name,
+        "time_seconds": ingest_time
+    })
 
 
 async def generate_gemini_response_httpx(session: httpx.AsyncClient, prompt: str) -> str:
+    """
+    Generate a response using the Gemini API.
+    
+    Parameters:
+        session (httpx.AsyncClient): HTTP client session for making requests.
+        prompt (str): The prompt to send to the Gemini API.
+        
+    Returns:
+        str: The generated text response from Gemini.
+    """
+    start_time = time.time()
     api_key = random.choice(GEMINI_API_KEY_LIST)
     headers = {'Content-Type': 'application/json'}
     payload = {'contents': [{'parts': [{'text': prompt}]}]}
+
+    # Log Gemini request (excluding the full prompt for brevity)
+    log_service_event("gemini_request", "Sending request to Gemini API", {
+        "prompt_length": len(prompt),
+        "model": GEMINI_MODEL_NAME
+    })
 
     # --- DEBUG PRINT 2: PAYLOAD GIVEN ---
     print("\n" + "="*50)
@@ -256,6 +379,13 @@ async def generate_gemini_response_httpx(session: httpx.AsyncClient, prompt: str
 
     try:
         response = await session.post(f"{GEMINI_API_URL}?key={api_key}", json=payload, headers=headers, timeout=90)
+        duration = time.time() - start_time
+
+        # Log response timing
+        log_service_event("gemini_response_received", "Received response from Gemini API", {
+            "status_code": response.status_code,
+            "duration_seconds": duration
+        })
 
         # --- DEBUG PRINT 3: OUTPUT RECEIVED ---
         print("\n" + "="*50)
@@ -272,18 +402,41 @@ async def generate_gemini_response_httpx(session: httpx.AsyncClient, prompt: str
 
         response.raise_for_status()
         data = response.json()
-        return data['candidates'][0]['content']['parts'][0]['text']
+        response_text = data['candidates'][0]['content']['parts'][0]['text']
+        
+        # Log successful response (only first 100 chars of text for brevity)
+        log_service_event("gemini_response_success", "Successfully processed Gemini response", {
+            "response_length": len(response_text),
+            "response_preview": response_text[:100] + ("..." if len(response_text) > 100 else ""),
+            "duration_seconds": duration
+        })
+        
+        return response_text
     except httpx.HTTPStatusError as e:
         error_msg = f"Gemini API error: {e.response.status_code} - {e.response.text}"
         print(f"❌ {error_msg}")
+        log_error("gemini_api_error", {
+            "status_code": e.response.status_code,
+            "response_text": e.response.text,
+            "duration_seconds": time.time() - start_time
+        })
         return error_msg
     except (KeyError, IndexError) as e:
         error_msg = f"Error parsing Gemini response: {e}. Response: {response.text}"
         print(f"❌ {error_msg}")
+        log_error("gemini_response_parse_error", {
+            "error": str(e),
+            "response_text": response.text if hasattr(response, 'text') else None,
+            "duration_seconds": time.time() - start_time
+        })
         return error_msg
     except Exception as e:
         error_msg = f"An unexpected error occurred during Gemini call: {e}"
         print(f"❌ {error_msg}")
+        log_error("gemini_unexpected_error", {
+            "error": str(e),
+            "duration_seconds": time.time() - start_time
+        })
         return error_msg
 
 
@@ -293,21 +446,66 @@ async def process_single_question(
     weaviate_client: weaviate.WeaviateClient,
     http_session: httpx.AsyncClient
 ) -> Answer:
+    """
+    Process a single question using RAG pipeline.
+    
+    Parameters:
+        question (str): The question to answer.
+        collection_name (str): Name of the Weaviate collection to query.
+        weaviate_client (weaviate.WeaviateClient): Client for Weaviate operations.
+        http_session (httpx.AsyncClient): HTTP client for external API calls.
+        
+    Returns:
+        Answer: An Answer object containing the question and generated answer.
+    """
+    question_id = str(uuid.uuid4())
+    start_time = time.time()
+    
     print(f"🔍 Processing question: '{question}'")
+    log_service_event("question_processing", "Processing question", {
+        "question_id": question_id,
+        "question": question,
+        "collection_name": collection_name
+    })
+    
+    # Generate embedding for the question
     embedding_model = ml_models['embedding_model']
     query_vector = embedding_model.encode(question).tolist()
+    log_service_event("embedding_generated", "Question embedding generated", {
+        "question_id": question_id,
+        "vector_dimension": len(query_vector)
+    })
+    
+    # Query Weaviate for relevant chunks
     policy_collection = weaviate_client.collections.get(collection_name)
     response = policy_collection.query.near_vector(
-        near_vector=query_vector, limit=TOP_K_RESULTS, return_properties=[
-            "content"]
+        near_vector=query_vector, limit=TOP_K_RESULTS, return_properties=["content"]
     )
     context_chunks = [obj.properties['content'] for obj in response.objects]
+    
+    log_service_event("context_retrieved", "Retrieved context chunks from Weaviate", {
+        "question_id": question_id,
+        "chunks_count": len(context_chunks),
+        "chunks_avg_length": sum(len(chunk) for chunk in context_chunks) / len(context_chunks) if context_chunks else 0
+    })
+    
     if not context_chunks:
         answer_text = "Based on the provided documents, I cannot find any relevant information to answer this question."
+        log_service_event("empty_context", "No context chunks found for question", {"question_id": question_id})
     else:
         context_str = "\n\n---\n\n".join(context_chunks)
         prompt = PROMPT_TEMPLATE.format(context=context_str, question=question)
         answer_text = await generate_gemini_response_httpx(http_session, prompt)
+    
+    processing_time = time.time() - start_time
+    
+    log_service_event("question_answered", "Question processing completed", {
+        "question_id": question_id,
+        "processing_time_seconds": processing_time,
+        "answer_length": len(answer_text),
+        "answer_preview": answer_text[:100] + ("..." if len(answer_text) > 100 else "")
+    })
+    
     return Answer(question=question, answer=answer_text)
 
 # --- 4. FastAPI Endpoint ---
@@ -318,20 +516,55 @@ async def process_document_and_answer_questions(
     request: QueryRequest = Body(...),
     token: str = Depends(verify_token)
 ):
+    """
+    Process a document and answer questions using RAG.
+    
+    This endpoint takes a document URL and a list of questions, processes the document
+    using a parsing API, stores the content in Weaviate, and generates answers using
+    the Gemini API.
+    
+    Parameters:
+        request (QueryRequest): Request body containing document URL and questions.
+        token (str): Authentication token from HTTP Bearer.
+        
+    Returns:
+        QueryResponse: Object containing answers to the questions.
+        
+    Raises:
+        HTTPException: For various errors during processing.
+    """
     start_time = time.time()
     weaviate_client = None
     collection_name = f"Doc_{uuid.uuid4().hex}"
+    request_id = str(uuid.uuid4())
 
     print("\n" + "="*50)
-    print("� TOKEN VERIFICATION SUCCESSFUL")
-    print("�🚀 STARTING DOCUMENT PROCESSING")
+    print("✓ TOKEN VERIFICATION SUCCESSFUL")
+    print("🚀 STARTING DOCUMENT PROCESSING")
     print(f"📄 Document URL: {request.documents}")
     print(f"❓ Number of questions: {len(request.questions)}")
     print("="*50 + "\n")
+    
+    # Log API request
+    log_api_request("/api/v1/hackrx/run", {
+        "request_id": request_id,
+        "document_url": request.documents,
+        "questions_count": len(request.questions),
+        "questions": request.questions
+    })
+    
     try:
         weaviate_client = await connect_to_weaviate()
         chunks = await fetch_and_parse_pdf(PARSING_API_URL, request.documents)
         await ingest_to_weaviate(weaviate_client, collection_name, chunks)
+        
+        # Log successful ingestion
+        log_service_event("document_ingested", "Document successfully ingested to Weaviate", {
+            "request_id": request_id,
+            "collection_name": collection_name,
+            "chunks_count": len(chunks)
+        })
+        
         async with httpx.AsyncClient() as http_session:
             tasks = [
                 process_single_question(
@@ -339,6 +572,7 @@ async def process_document_and_answer_questions(
                 for q in request.questions
             ]
             final_answers = await asyncio.gather(*tasks)
+        
         end_time = time.time()
         processing_time = end_time - start_time
         answer_texts = [a.answer for a in final_answers]
@@ -349,23 +583,56 @@ async def process_document_and_answer_questions(
         print(f"📊 Number of questions processed: {len(final_answers)}")
         print("="*50 + "\n")
 
+        # Create response object
+        response = QueryResponse(answers=answer_texts)
+        
+        # Log API response
+        log_api_response("/api/v1/hackrx/run", {
+            "request_id": request_id,
+            "answers_count": len(answer_texts),
+            "answers": [a[:100] + ("..." if len(a) > 100 else "") for a in answer_texts],  # Log previews only for brevity
+            "processing_time_seconds": processing_time
+        }, duration=processing_time)
+        
         # Just return answers as requested
-        return QueryResponse(answers=answer_texts)
+        return response
     except Exception as e:
-        print(f"❌ A critical error occurred: {e}")
+        error_msg = f"A critical error occurred: {e}"
+        print(f"❌ {error_msg}")
+        
+        # Log error
+        log_error("critical_processing_error", {
+            "request_id": request_id,
+            "error": str(e),
+            "document_url": request.documents,
+            "questions_count": len(request.questions),
+            "processing_time_seconds": time.time() - start_time
+        })
+        
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if weaviate_client and weaviate_client.is_connected():
             if weaviate_client.collections.exists(collection_name):
                 weaviate_client.collections.delete(collection_name)
-                print(
-                    f"\n✅ Cleaned up and deleted collection: '{collection_name}'")
+                print(f"\n✅ Cleaned up and deleted collection: '{collection_name}'")
+                log_service_event("collection_deleted", "Cleaned up Weaviate collection", {
+                    "request_id": request_id,
+                    "collection_name": collection_name
+                })
             weaviate_client.close()
             print("✅ Weaviate client connection closed.")
+            log_service_event("connection_closed", "Weaviate client connection closed", {"request_id": request_id})
 
 # Include the router in the main app
 app.include_router(router)
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
+    # Set up file logging before starting the application
+    setup_file_logging()
+    log_service_event("application_launch", "Starting application directly", {
+        "host": "0.0.0.0", 
+        "port": 8000,
+        "reload": True
+    })
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
