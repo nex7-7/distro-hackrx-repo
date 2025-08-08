@@ -22,6 +22,7 @@ import shutil
 import os.path
 from urllib.parse import urlparse, unquote
 from tqdm import tqdm
+import fitz  # PyMuPDF for fallback PDF parsing
 
 from fastapi import FastAPI, HTTPException, Body, Header, Depends, Security, HTTPException, APIRouter
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -74,10 +75,9 @@ RULES:
 1. Base your answer exclusively on the information within the "--- CONTEXT ---" section. Do not use any external knowledge or assumptions.
 2. If the context does not contain the answer, reply exactly: "Based on the provided documents, I cannot find a definitive answer to this question."
 3. When present in the context, include specific data points such as dates, durations, quantities, monetary amounts, percentages, definitions, conditions, eligibility criteria, exceptions, or exclusions.
-4. Synthesize a single, standalone paragraph without line breaks or tabs. Keep it concise and self-contained.
+4. Synthesize a single, standalone paragraph without line breaks or tabs. The Paragraph should be very small . The answers should be direct not long.
 5. If you can only answer part of the question, state what you can answer and specify which part is unresolved due to missing context.
 6. Pay special attention to Context blocks with higher relevance scores - they are more likely to contain information directly related to the question.
-
 ---
 Example:
 --- CONTEXT ---
@@ -406,7 +406,7 @@ async def extract_and_process_zip(api_url: str, zip_content: bytes, original_fil
                             })
 
                     except Exception as e:
-                        # Log error but continue with other documents
+                        # Log error and try PyMuPDF fallback for PDF files
                         log_error("zip_document_parsing_error", {
                             "zip_id": zip_id,
                             "document_file": pdf_file,
@@ -414,7 +414,45 @@ async def extract_and_process_zip(api_url: str, zip_content: bytes, original_fil
                             "error": str(e)
                         })
                         print(f"⚠️ Error parsing '{pdf_file}' from ZIP: {e}")
-                        continue
+
+                        # Try PyMuPDF fallback for PDF files only
+                        if file_ext.lower() == '.pdf':
+                            print(
+                                f"🔄 Attempting PyMuPDF fallback for '{pdf_file}' from ZIP...")
+                            log_service_event("zip_fallback_attempt", "Attempting PyMuPDF fallback for ZIP document", {
+                                "zip_id": zip_id,
+                                "document_file": pdf_file,
+                                "original_error": str(e)
+                            })
+
+                            try:
+                                # Create a unique document ID for this ZIP document
+                                zip_doc_id = f"{zip_id}-{pdf_file}"
+                                fallback_chunks = fallback_parse_pdf_with_pymupdf(
+                                    pdf_content, zip_doc_id, pdf_file)
+                                combined_chunks.extend(fallback_chunks)
+
+                                log_service_event("zip_fallback_success", f"Successfully parsed ZIP document with PyMuPDF fallback", {
+                                    "zip_id": zip_id,
+                                    "document_file": pdf_file,
+                                    "chunks_count": len(fallback_chunks)
+                                })
+                                print(
+                                    f"✅ PyMuPDF fallback successful for '{pdf_file}' from ZIP")
+
+                            except Exception as fallback_error:
+                                log_error("zip_fallback_failed", {
+                                    "zip_id": zip_id,
+                                    "document_file": pdf_file,
+                                    "fallback_error": str(fallback_error),
+                                    "original_error": str(e)
+                                })
+                                print(
+                                    f"❌ PyMuPDF fallback also failed for '{pdf_file}' from ZIP: {fallback_error}")
+                                continue
+                        else:
+                            # For non-PDF files, just continue with next document
+                            continue
 
         except zipfile.BadZipFile as e:
             error_msg = f"Invalid ZIP file: {e}"
@@ -580,7 +618,34 @@ async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
             "error": str(e),
             "elapsed_time": time.time() - start_time
         })
-        raise HTTPException(status_code=503, detail=error_msg)
+
+        # Try PyMuPDF fallback for PDF files only
+        if file_extension.lower() == '.pdf':
+            print(
+                f"⚠️ Parsing service failed for '{filename}', attempting PyMuPDF fallback...")
+            log_service_event("attempting_fallback", "Parsing service failed, attempting PyMuPDF fallback", {
+                "document_id": document_id,
+                "filename": filename,
+                "original_error": str(e)
+            })
+
+            try:
+                return fallback_parse_pdf_with_pymupdf(file_response.content, document_id, filename)
+            except HTTPException:
+                # Re-raise the HTTPException from fallback function
+                raise
+            except Exception as fallback_error:
+                log_error("fallback_unexpected_error", {
+                    "document_id": document_id,
+                    "filename": filename,
+                    "fallback_error": str(fallback_error),
+                    "original_error": str(e)
+                })
+                # If fallback also fails, raise the original parsing service error
+                raise HTTPException(status_code=503, detail=error_msg)
+        else:
+            # For non-PDF files, just raise the original error
+            raise HTTPException(status_code=503, detail=error_msg)
 
     # Parse the response and log structure details
     try:
@@ -672,6 +737,158 @@ async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
         "total_processing_time": time.time() - start_time
     })
     return chunk_texts
+
+
+def fallback_parse_pdf_with_pymupdf(pdf_content: bytes, document_id: str, filename: str) -> List[str]:
+    """
+    Fallback function to parse PDF using PyMuPDF when the main parsing service fails.
+
+    Parameters:
+        pdf_content (bytes): The PDF file content as bytes
+        document_id (str): Unique identifier for tracking this document
+        filename (str): Name of the PDF file for logging
+
+    Returns:
+        List[str]: List of text chunks extracted from the PDF
+
+    Raises:
+        HTTPException: If PyMuPDF parsing also fails
+    """
+    fallback_start_time = time.time()
+
+    print(
+        f"🔄 Attempting fallback PDF parsing with PyMuPDF for '{filename}'...")
+    log_service_event("fallback_parsing_start", "Starting fallback PDF parsing with PyMuPDF", {
+        "document_id": document_id,
+        "filename": filename,
+        "pdf_size_bytes": len(pdf_content),
+        "fallback_method": "PyMuPDF"
+    })
+
+    try:
+        # Create a temporary file to write the PDF content
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
+            temp_file.write(pdf_content)
+            temp_pdf_path = temp_file.name
+
+        try:
+            # Open the PDF with PyMuPDF
+            pdf_doc = fitz.open(temp_pdf_path)
+            total_pages = len(pdf_doc)
+
+            # Extract text from all pages
+            page_texts = []
+            for page_num in range(total_pages):
+                page = pdf_doc.load_page(page_num)
+                page_text = page.get_text()
+
+                if page_text.strip():  # Only add non-empty pages
+                    page_texts.append(page_text.strip())
+
+            pdf_doc.close()
+
+            # Log extraction results
+            log_service_event("fallback_text_extracted", "Extracted text using PyMuPDF", {
+                "document_id": document_id,
+                "pages_processed": total_pages,
+                "pages_with_text": len(page_texts),
+                "total_chars": sum(len(text) for text in page_texts),
+                "avg_chars_per_page": sum(len(text) for text in page_texts) / len(page_texts) if page_texts else 0
+            })
+
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(temp_pdf_path)
+            except Exception as cleanup_error:
+                log_error("temp_file_cleanup_failed", {
+                    "document_id": document_id,
+                    "temp_file": temp_pdf_path,
+                    "error": str(cleanup_error)
+                })
+
+        if not page_texts:
+            error_msg = "No text could be extracted from the PDF using PyMuPDF fallback."
+            log_error("fallback_no_text_extracted", {
+                "document_id": document_id,
+                "filename": filename,
+                "pages_count": total_pages if 'total_pages' in locals() else 0
+            })
+            raise HTTPException(status_code=422, detail=error_msg)
+
+        # Split page texts into smaller chunks based on paragraphs and sentences
+        chunk_texts = []
+        for page_num, page_text in enumerate(page_texts):
+            # Split by double newlines (paragraphs) first
+            paragraphs = [p.strip()
+                          for p in page_text.split('\n\n') if p.strip()]
+
+            for paragraph in paragraphs:
+                # If paragraph is too long, split by sentences
+                if len(paragraph) > 1000:
+                    # Simple sentence splitting on periods, exclamation marks, and question marks
+                    sentences = []
+                    current_sentence = ""
+
+                    for char in paragraph:
+                        current_sentence += char
+                        if char in '.!?' and len(current_sentence.strip()) > 20:
+                            sentences.append(current_sentence.strip())
+                            current_sentence = ""
+
+                    # Add any remaining text
+                    if current_sentence.strip():
+                        sentences.append(current_sentence.strip())
+
+                    # Group sentences into reasonable chunks
+                    current_chunk = ""
+                    for sentence in sentences:
+                        if len(current_chunk + " " + sentence) > 800:
+                            if current_chunk:
+                                chunk_texts.append(current_chunk.strip())
+                            current_chunk = sentence
+                        else:
+                            current_chunk += " " + sentence if current_chunk else sentence
+
+                    if current_chunk:
+                        chunk_texts.append(current_chunk.strip())
+                else:
+                    chunk_texts.append(paragraph)
+
+        # Filter out very short chunks
+        chunk_texts = [
+            chunk for chunk in chunk_texts if len(chunk.strip()) > 50]
+
+        fallback_time = time.time() - fallback_start_time
+
+        # Log successful fallback parsing
+        log_service_event("fallback_parsing_complete", "Successfully parsed PDF with PyMuPDF fallback", {
+            "document_id": document_id,
+            "filename": filename,
+            "chunks_extracted": len(chunk_texts),
+            "total_chars": sum(len(chunk) for chunk in chunk_texts),
+            "avg_chunk_length": sum(len(chunk) for chunk in chunk_texts) / len(chunk_texts) if chunk_texts else 0,
+            "fallback_time_seconds": fallback_time,
+            "chunk_size_distribution": {
+                "short_chunks": sum(1 for chunk in chunk_texts if len(chunk) < 200),
+                "medium_chunks": sum(1 for chunk in chunk_texts if 200 <= len(chunk) < 500),
+                "long_chunks": sum(1 for chunk in chunk_texts if len(chunk) >= 500)
+            }
+        })
+
+        print(
+            f"✅ PyMuPDF fallback extracted {len(chunk_texts)} text chunks from '{filename}'")
+        return chunk_texts
+
+    except Exception as e:
+        error_msg = f"PyMuPDF fallback parsing also failed: {e}"
+        log_error("fallback_parsing_failed", {
+            "document_id": document_id,
+            "filename": filename,
+            "error": str(e),
+            "fallback_time_seconds": time.time() - fallback_start_time
+        })
+        raise HTTPException(status_code=503, detail=error_msg)
 
 
 def clean_and_rechunk_texts(chunk_texts: List[str], chunk_token_size: int = 450, overlap: int = 30) -> List[str]:
