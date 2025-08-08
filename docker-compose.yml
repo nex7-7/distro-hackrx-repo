@@ -1,0 +1,84 @@
+services:
+  # Weaviate vector database
+  weaviate:
+    image: semitechnologies/weaviate:1.30.14
+    container_name: rag-weaviate
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'none'
+      ENABLE_MODULES: ''
+      CLUSTER_HOSTNAME: 'node1'
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # RAG Application API
+  rag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # API Configuration
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      
+      # Weaviate Configuration (use container name for internal networking)
+      WEAVIATE_URL: http://weaviate:8080
+      
+      # Load other variables from .env file
+      API_BEARER_TOKEN: ${API_BEARER_TOKEN}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      LLM_MODEL: ${LLM_MODEL:-gemini-2.5-flash}
+      WEAVIATE_CLASS_NAME: ${WEAVIATE_CLASS_NAME:-DocumentChunks}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      MIN_CHUNK_SIZE: ${MIN_CHUNK_SIZE:-100}
+      MAX_CHUNK_SIZE: ${MAX_CHUNK_SIZE:-1000}
+      CHUNK_OVERLAP_PERCENTAGE: ${CHUNK_OVERLAP_PERCENTAGE:-5}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FILE: ${LOG_FILE:-logs/app.log}
+      MAX_WORKERS: ${MAX_WORKERS:-4}
+      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-5}
+    volumes:
+      # Mount logs directory for persistence
+      - ./logs:/app/logs
+      # Mount temporary directories (optional, for debugging)
+      - ./temp:/app/temp
+      - ./downloads:/app/downloads
+      - ./cache:/app/cache
+    networks:
+      - rag-network
+    depends_on:
+      weaviate:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+networks:
+  rag-network:
+    driver: bridge
+    name: rag-network
+
+volumes:
+  weaviate_data:
+    name: rag-weaviate-data
+    driver: local

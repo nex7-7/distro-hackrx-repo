@@ -1,0 +1,48 @@
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# Virtual Environment
+.venv
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Logs and temporary files
+logs/
+*.log
+temp/
+tmp/
+downloads/
+cache/
+
+# Testing and development
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# GitHub (keeping this commented since we need it for instructions)
+.github

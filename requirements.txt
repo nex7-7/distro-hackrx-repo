@@ -1,0 +1,32 @@
+# FastAPI and web framework
+fastapi
+uvicorn
+
+# Pydantic for data validation
+pydantic
+
+# Vector database
+weaviate-client
+
+# LLM integration
+google-generativeai
+
+# Document processing
+pymupdf4llm
+pdfplumber
+python-docx
+openpyxl
+pytesseract
+
+# Embeddings
+sentence-transformers
+
+# Utilities
+python-dotenv
+requests
+python-multipart
+
+# Development and testing
+pytest
+black
+mypy
