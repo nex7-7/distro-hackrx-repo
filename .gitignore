@@ -17,3 +17,4 @@
 *.pytest_cache
 *.vscode
 .idea
+*.dev
