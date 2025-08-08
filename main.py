@@ -170,9 +170,9 @@ async def connect_to_weaviate() -> weaviate.WeaviateClient:
     for i in range(5):  # 5 retries
         try:
             client = weaviate.connect_to_local(
-                host=WEAVIATE_HOST,
-                port=WEAVIATE_PORT,
-                grpc_port=WEAVIATE_GRPC_PORT,
+                host="127.0.0.1",
+                port="8080",
+                grpc_port="50051",
             )
             if client.is_ready():
                 print("✅ Weaviate is ready!")
