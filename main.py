@@ -16,7 +16,11 @@ from dotenv import load_dotenv
 
 import requests
 import httpx
-from urllib.parse import urlparse
+import zipfile
+import tempfile
+import shutil
+import os.path
+from urllib.parse import urlparse, unquote
 from tqdm import tqdm
 
 from fastapi import FastAPI, HTTPException, Body, Header, Depends, Security, HTTPException, APIRouter
@@ -251,16 +255,214 @@ async def connect_to_weaviate() -> weaviate.WeaviateClient:
     raise ConnectionError(error_msg)
 
 
-async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
+async def extract_and_process_zip(api_url: str, zip_content: bytes, original_filename: str) -> List[str]:
     """
-    Downloads a PDF and sends it to a parsing API to get text chunks.
+    Extracts a ZIP file and processes any supported document files found inside.
+
+    Supported formats include: PDF, DOCX, DOC, TXT, MD, RTF
 
     Parameters:
         api_url (str): URL of the parsing API.
-        file_url (str): URL of the PDF file to download.
+        zip_content (bytes): The content of the ZIP file.
+        original_filename (str): The original filename of the ZIP file.
 
     Returns:
-        List[str]: List of text chunks extracted from the PDF.
+        List[str]: Combined list of text chunks from all documents in the ZIP.
+
+    Raises:
+        HTTPException: If ZIP extraction fails or no supported documents are found.
+    """
+    zip_id = str(uuid.uuid4())
+    combined_chunks = []
+
+    # Create a temporary directory for extraction
+    with tempfile.TemporaryDirectory() as temp_dir:
+        zip_path = os.path.join(temp_dir, "downloaded.zip")
+
+        # Log zip extraction start
+        log_service_event("zip_extraction_start", "Starting ZIP file extraction", {
+            "zip_id": zip_id,
+            "original_filename": original_filename,
+            "content_size_bytes": len(zip_content),
+            "temp_dir": temp_dir
+        })
+
+        # Write ZIP content to temporary file
+        with open(zip_path, 'wb') as f:
+            f.write(zip_content)
+
+        try:
+            # Extract ZIP file
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+                file_list = zip_ref.namelist()
+
+                # Log extraction completion
+                log_service_event("zip_extraction_complete", "ZIP file extracted successfully", {
+                    "zip_id": zip_id,
+                    "files_count": len(file_list),
+                    "extracted_files": file_list[:10] + (["..."] if len(file_list) > 10 else [])
+                })
+
+                # Define supported document file extensions
+                supported_extensions = [
+                    '.pdf', '.docx', '.doc', '.txt', '.md', '.rtf']
+
+                # Map file extensions to content types
+                content_type_map = {
+                    '.pdf': 'application/pdf',
+                    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                    '.doc': 'application/msword',
+                    '.txt': 'text/plain',
+                    '.md': 'text/markdown',
+                    '.rtf': 'application/rtf'
+                }
+
+                # Find all supported document files in the extracted content
+                doc_files = []
+                for f in file_list:
+                    ext = os.path.splitext(f.lower())[1]
+                    if ext in supported_extensions:
+                        doc_files.append(f)
+
+                if not doc_files:
+                    error_msg = "No supported document files found in the ZIP archive."
+                    log_error("no_documents_in_zip", {
+                        "zip_id": zip_id,
+                        "original_filename": original_filename,
+                        "supported_extensions": supported_extensions
+                    })
+                    raise HTTPException(status_code=422, detail=error_msg)
+
+                print(
+                    f"📁 Found {len(doc_files)} document files in ZIP archive")
+                log_service_event("documents_found_in_zip", f"Found document files in ZIP archive", {
+                    "zip_id": zip_id,
+                    "document_count": len(doc_files),
+                    "document_files": doc_files[:5] + (["..."] if len(doc_files) > 5 else [])
+                })
+
+                # Process each document file
+                for pdf_file in doc_files:
+                    file_path = os.path.join(temp_dir, pdf_file)
+                    file_ext = os.path.splitext(pdf_file.lower())[1]
+
+                    # Determine content type based on extension
+                    content_type = content_type_map.get(
+                        file_ext, 'application/pdf')
+
+                    # Read the file content
+                    with open(file_path, 'rb') as f:
+                        pdf_content = f.read()
+
+                    print(
+                        f"📄 Processing {file_ext.upper()} file '{pdf_file}' from ZIP")
+
+                    # Create a MultipartEncoder for the document
+                    encoder = MultipartEncoder(
+                        fields={'file': (os.path.basename(
+                            pdf_file), pdf_content, content_type)}
+                    )
+
+                    # Send the document to the parsing API
+                    print(
+                        f"➡️  Sending '{pdf_file}' from ZIP to parsing API...")
+                    log_service_event("parsing_zip_document", f"Sending document from ZIP to parsing API", {
+                        "zip_id": zip_id,
+                        "document_file": pdf_file,
+                        "file_extension": file_ext,
+                        "content_type": content_type,
+                        "file_size_bytes": len(pdf_content)
+                    })
+
+                    # Parse the PDF
+                    try:
+                        response = requests.post(api_url, data=encoder, headers={
+                            'Content-Type': encoder.content_type
+                        })
+                        response.raise_for_status()
+
+                        # Extract chunks from response
+                        response_json = response.json()
+                        blocks = response_json.get('return_dict', {}).get(
+                            'result', {}).get('blocks', [])
+
+                        if blocks:
+                            pdf_chunks = [
+                                " ".join(block.get('sentences', [])) for block in blocks]
+                            combined_chunks.extend(pdf_chunks)
+
+                            log_service_event("zip_document_parsed", f"Successfully parsed document from ZIP", {
+                                "zip_id": zip_id,
+                                "document_file": pdf_file,
+                                "file_extension": file_ext,
+                                "chunks_count": len(pdf_chunks)
+                            })
+                        else:
+                            log_service_event("zip_document_empty", f"No text chunks found in document from ZIP", {
+                                "zip_id": zip_id,
+                                "document_file": pdf_file,
+                                "file_extension": file_ext
+                            })
+
+                    except Exception as e:
+                        # Log error but continue with other documents
+                        log_error("zip_document_parsing_error", {
+                            "zip_id": zip_id,
+                            "document_file": pdf_file,
+                            "file_extension": file_ext,
+                            "error": str(e)
+                        })
+                        print(f"⚠️ Error parsing '{pdf_file}' from ZIP: {e}")
+                        continue
+
+        except zipfile.BadZipFile as e:
+            error_msg = f"Invalid ZIP file: {e}"
+            log_error("invalid_zip_file", {
+                "zip_id": zip_id,
+                "error": str(e)
+            })
+            raise HTTPException(status_code=422, detail=error_msg)
+
+    # Check if we got any chunks
+    if not combined_chunks:
+        error_msg = "No text could be extracted from the documents in the ZIP file."
+        log_error("no_text_from_zip_documents", {
+            "zip_id": zip_id,
+            "original_filename": original_filename
+        })
+        raise HTTPException(status_code=422, detail=error_msg)
+
+    log_service_event("zip_processing_complete", "Completed processing of ZIP archive", {
+        "zip_id": zip_id,
+        "total_chunks": len(combined_chunks),
+        "documents_processed": len(doc_files)
+    })
+
+    return combined_chunks
+
+
+async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
+    """
+    Downloads and processes document files for text extraction.
+
+    Supported formats:
+    - PDF (.pdf)
+    - Word Documents (.docx, .doc)
+    - Text Files (.txt)
+    - Markdown Files (.md)
+    - Rich Text Format (.rtf)
+    - ZIP archives containing any of the above formats
+
+    If the file is a supported document, sends it to the parsing API to extract text.
+    If the file is a ZIP archive, extracts it and processes all supported documents inside.
+
+    Parameters:
+        api_url (str): URL of the parsing API.
+        file_url (str): URL of the file to download.
+
+    Returns:
+        List[str]: List of text chunks extracted from the document(s).
 
     Raises:
         HTTPException: If download fails, parsing fails, or no text chunks are found.
@@ -277,17 +479,17 @@ async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
 
     try:
         download_start = time.time()
-        pdf_response = requests.get(file_url)
-        pdf_response.raise_for_status()
+        file_response = requests.get(file_url)
+        file_response.raise_for_status()
         download_time = time.time() - download_start
 
         # Log download completion with detailed metrics
         log_service_event("download_complete", f"Document downloaded successfully", {
             "document_id": document_id,
-            "size_bytes": len(pdf_response.content),
+            "size_bytes": len(file_response.content),
             "download_time_seconds": download_time,
-            "content_type": pdf_response.headers.get('Content-Type'),
-            "status_code": pdf_response.status_code
+            "content_type": file_response.headers.get('Content-Type'),
+            "status_code": file_response.status_code
         })
     except requests.RequestException as e:
         error_msg = f"Failed to download document from URL: {e}"
@@ -299,16 +501,61 @@ async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
         })
         raise HTTPException(status_code=400, detail=error_msg)
 
-    filename = os.path.basename(urlparse(file_url).path)
+    filename = os.path.basename(unquote(urlparse(file_url).path))
+    file_extension = os.path.splitext(filename.lower())[1]
+
+    # Check if the downloaded file is a ZIP
+    if file_extension == '.zip':
+        print(f"📦 Detected ZIP file: '{filename}'")
+        log_service_event("zip_file_detected", "ZIP file detected, will extract and process", {
+            "document_id": document_id,
+            "filename": filename,
+            "file_size_bytes": len(file_response.content)
+        })
+
+        # Process the ZIP file
+        return await extract_and_process_zip(api_url, file_response.content, filename)
+
+    # Determine content type based on file extension
+    content_type_map = {
+        '.pdf': 'application/pdf',
+        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        '.doc': 'application/msword',
+        '.txt': 'text/plain',
+        '.md': 'text/markdown',
+        '.rtf': 'application/rtf'
+    }
+
+    # Get appropriate content type or default to PDF
+    content_type = content_type_map.get(file_extension, 'application/pdf')
+
+    # Log the detected file type
+    if file_extension in content_type_map:
+        print(f"📄 Detected {file_extension.upper()} file: '{filename}'")
+        log_service_event("supported_file_type_detected", f"Detected supported file type: {file_extension}", {
+            "document_id": document_id,
+            "filename": filename,
+            "extension": file_extension,
+            "content_type": content_type
+        })
+    else:
+        print(
+            f"⚠️ Unknown file extension '{file_extension}', treating as PDF: '{filename}'")
+        log_service_event("unknown_file_extension", "Unknown file extension, treating as PDF", {
+            "document_id": document_id,
+            "filename": filename,
+            "extension": file_extension
+        })
+
     encoder = MultipartEncoder(
-        fields={'file': (filename, pdf_response.content, 'application/pdf')})
+        fields={'file': (filename, file_response.content, content_type)})
 
     print(f"➡️  Sending '{filename}' to parsing API at {api_url}...")
     log_service_event("parsing_start", f"Sending document to parsing API", {
         "document_id": document_id,
         "filename": filename,
         "api": api_url,
-        "file_size_bytes": len(pdf_response.content)
+        "file_size_bytes": len(file_response.content)
     })
 
     try:
