@@ -28,6 +28,7 @@ from app.core.chunking import document_chunker
 from app.services.llm_service import llm_service
 from app.services.vector_store import vector_store
 from app.services.embedding_service import embedding_service
+from app.services.reranking_service import reranking_service
 from app.utils.logger import get_logger
 from app.utils.exceptions import (
     RAGApplicationError,
@@ -62,8 +63,8 @@ class RAGPipeline:
         Executes the complete 6-stage RAG pipeline:
         1. Document Processing
         2. Chunking & Vectorization 
-        3. Query Classification
-        4. Context Retrieval
+        3. Query Restructuring (simplified, no document context needed)
+        4. Context Retrieval & Reranking
         5. Response Generation
         6. Response Formatting
         
@@ -89,13 +90,13 @@ class RAGPipeline:
             # Stage 2: Data Chunking & Vectorization
             was_processed = await self._stage_2_chunking_vectorization(document_info)
             
-            # Stage 3: Query Analysis & Classification
-            query_analyses = await self._stage_3_query_classification(
+            # Stage 3: Query Restructuring (was Query Classification)
+            query_analyses = await self._stage_3_query_restructuring(
                 request.questions, document_info
             )
             
-            # Stage 4: Context Retrieval
-            retrieval_results = await self._stage_4_context_retrieval(
+            # Stage 4: Context Retrieval & Reranking
+            retrieval_results = await self._stage_4_context_retrieval_reranking(
                 query_analyses, document_info.content_hash
             )
             
@@ -178,36 +179,26 @@ class RAGPipeline:
             logger.error(f"Stage 2 failed: {str(e)}")
             raise
     
-    async def _stage_3_query_classification(
+    async def _stage_3_query_restructuring(
         self, 
         questions: List[str], 
         document_info: DocumentInfo
     ) -> List[QueryAnalysis]:
         """
-        Stage 3: Query Analysis & Classification.
+        Stage 3: Query Restructuring.
         
-        Uses LLM to classify queries and extract keywords for vector search.
+        Uses LLM to restructure queries into statements that would be present in chunks.
         This is the first LLM call that processes all questions at once.
+        No document context is needed for this step.
         """
-        logger.log_stage("Stage 3", "Query Classification", 
+        logger.log_stage("Stage 3", "Query Restructuring", 
                         question_count=len(questions))
         
         try:
-            analyses = await llm_service.classify_queries(
-                questions,
-                document_info.filename,
-                document_info.first_five_pages
-            )
-            
-            from_doc_count = sum(
-                1 for a in analyses 
-                if a.classification == QueryClassification.FROM_DOCUMENT
-            )
+            analyses = await llm_service.restructure_queries(questions)
             
             logger.log_stage("Stage 3", "Completed",
-                            total_queries=len(analyses),
-                            from_document=from_doc_count,
-                            general_knowledge=len(analyses) - from_doc_count)
+                            total_queries=len(analyses))
             
             return analyses
             
@@ -215,34 +206,29 @@ class RAGPipeline:
             logger.error(f"Stage 3 failed: {str(e)}")
             raise
     
-    async def _stage_4_context_retrieval(
+    async def _stage_4_context_retrieval_reranking(
         self, 
         query_analyses: List[QueryAnalysis],
         document_hash: str
     ) -> Dict[str, str]:
         """
-        Stage 4: Context Retrieval.
+        Stage 4: Context Retrieval & Reranking.
         
-        Retrieves relevant context for document-based queries using parallel
-        vector search operations within the specific document's collection.
+        Retrieves top 30 chunks for each query using parallel vector search,
+        then reranks them using cross-encoder to get top 7 chunks.
         """
-        logger.log_stage("Stage 4", "Context Retrieval", document_hash=document_hash)
+        logger.log_stage("Stage 4", "Context Retrieval & Reranking", document_hash=document_hash)
         
         try:
-            # Filter queries that need document context
-            doc_queries = [
-                analysis for analysis in query_analyses
-                if analysis.classification == QueryClassification.FROM_DOCUMENT
-            ]
-            
-            if not doc_queries:
-                logger.log_stage("Stage 4", "Completed - No document queries")
+            # All queries are now treated as document queries
+            if not query_analyses:
+                logger.log_stage("Stage 4", "Completed - No queries")
                 return {}
             
             # Create retrieval tasks for parallel execution
             retrieval_tasks = []
-            for analysis in doc_queries:
-                task = self._retrieve_context_for_query(analysis, document_hash)
+            for analysis in query_analyses:
+                task = self._retrieve_and_rerank_context_for_query(analysis, document_hash)
                 retrieval_tasks.append(task)
             
             # Execute retrievals in parallel
@@ -250,11 +236,11 @@ class RAGPipeline:
             
             # Build context dictionary
             contexts = {}
-            for analysis, context in zip(doc_queries, retrieval_results):
+            for analysis, context in zip(query_analyses, retrieval_results):
                 contexts[analysis.query_id] = context
             
             logger.log_stage("Stage 4", "Completed",
-                            retrieval_count=len(doc_queries),
+                            retrieval_count=len(query_analyses),
                             contexts_found=len([c for c in contexts.values() if c]))
             
             return contexts
@@ -263,57 +249,77 @@ class RAGPipeline:
             logger.error(f"Stage 4 failed: {str(e)}")
             raise
     
-    async def _retrieve_context_for_query(self, analysis: QueryAnalysis, document_hash: str) -> str:
+    async def _retrieve_and_rerank_context_for_query(self, analysis: QueryAnalysis, document_hash: str) -> str:
         """
-        Retrieve context for a single query using vector search within document collection.
+        Retrieve top 30 chunks and rerank to get top 7 for a single query.
         
         Args:
-            analysis: Query analysis with keywords
+            analysis: Query analysis with restructured phrases
             document_hash: Hash of the document to search within
             
         Returns:
-            str: Combined context from retrieved chunks
+            str: Combined context from top 7 reranked chunks
         """
         try:
             if not analysis.keywords:
-                logger.warning("No keywords for document query", 
+                logger.warning("No restructured statement for query", 
                              query_id=analysis.query_id)
                 return ""
             
-            # Use vector search with keywords within specific document
+            # Step 1: Use vector search to get top 30 chunks
+            # keywords[0] contains the single rephrased statement
+            search_query = analysis.keywords[0] if analysis.keywords else analysis.original_query
             chunks_and_scores = await vector_store.search_by_keywords(
-                analysis.keywords, document_hash
+                search_query, document_hash, limit=30
             )
             
             if not chunks_and_scores:
-                logger.warning("No context found for query",
+                logger.warning("No chunks found for query",
                              query_id=analysis.query_id,
                              keywords=analysis.keywords,
                              document_hash=document_hash)
                 return ""
             
-            # Combine chunk contents (de-duplicate if needed)
+            # Extract just the chunks for reranking
+            chunks = [chunk for chunk, _ in chunks_and_scores]
+            
+            logger.debug("Retrieved chunks for reranking",
+                        query_id=analysis.query_id,
+                        chunk_count=len(chunks))
+            
+            # Step 2: Rerank chunks using cross-encoder to get top 7
+            reranked_chunks = await reranking_service.rerank_chunks(
+                analysis.original_query,
+                chunks,
+                top_k=7
+            )
+            
+            logger.debug("Reranked chunks",
+                        query_id=analysis.query_id,
+                        original_count=len(chunks),
+                        reranked_count=len(reranked_chunks))
+            
+            # Step 3: Combine chunk contents (de-duplicate if needed)
             seen_chunks = set()
             context_parts = []
             
-            for chunk, score in chunks_and_scores:
+            for chunk in reranked_chunks:
                 if chunk.chunk_id not in seen_chunks:
                     context_parts.append(chunk.content)
                     seen_chunks.add(chunk.chunk_id)
             
             context = "\n\n".join(context_parts)
             
-            logger.debug("Context retrieved for query",
+            logger.debug("Context assembled for query",
                         query_id=analysis.query_id,
-                        chunk_count=len(context_parts),
-                        context_length=len(context),
-                        document_hash=document_hash)
+                        unique_chunks=len(seen_chunks),
+                        context_length=len(context))
             
             return context
             
         except Exception as e:
-            logger.error(f"Context retrieval failed for query {analysis.query_id}: {str(e)}")
-            return ""  # Return empty context rather than failing the whole pipeline
+            logger.error(f"Context retrieval and reranking failed for query {analysis.query_id}: {str(e)}")
+            return ""
     
     async def _stage_5_response_generation(
         self, 

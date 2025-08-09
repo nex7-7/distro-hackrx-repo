@@ -8,6 +8,7 @@ for Stage 2 (vectorization) and Stage 4 (retrieval) of the RAG pipeline.
 
 import asyncio
 import time
+import os
 from typing import List, Optional, Union
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -49,10 +50,18 @@ class EmbeddingService:
         self._initialized = True
         self.model: Optional[SentenceTransformer] = None
         self.model_name = settings.embedding_model
-        self.executor = ThreadPoolExecutor(max_workers=settings.max_workers)
+        
+        # Use a more conservative thread pool to avoid resource contention
+        max_workers = max(1, min(settings.max_workers, 4))  # Cap at 4 for embedding
+        self.executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="embedding_worker"
+        )
         self._model_lock = threading.Lock()
         
-        logger.info("Embedding service initialized", model=self.model_name)
+        logger.info("Embedding service initialized", 
+                   model=self.model_name,
+                   max_workers=max_workers)
     
     def _load_model(self) -> SentenceTransformer:
         """
@@ -71,10 +80,15 @@ class EmbeddingService:
                         logger.info("Loading embedding model", model=self.model_name)
                         start_time = time.time()
                         
+                        logger.debug("Creating SentenceTransformer instance")
                         self.model = SentenceTransformer(self.model_name)
+                        logger.debug("SentenceTransformer instance created successfully")
                         
                         # Warm up the model with a dummy embedding
-                        _ = self.model.encode("warm up text", show_progress_bar=False)
+                        logger.debug("Warming up model with dummy text")
+                        dummy_result = self.model.encode("warm up text", show_progress_bar=False)
+                        logger.debug("Model warm-up completed", 
+                                   dummy_embedding_shape=dummy_result.shape if hasattr(dummy_result, 'shape') else len(dummy_result))
                         
                         load_time = time.time() - start_time
                         logger.log_performance(
@@ -84,6 +98,11 @@ class EmbeddingService:
                         )
                         
                     except Exception as e:
+                        logger.error("Failed to load embedding model",
+                                   model=self.model_name,
+                                   error=str(e),
+                                   error_type=type(e).__name__)
+                        logger.exception("Full model loading exception")
                         raise create_error(
                             EmbeddingError,
                             f"Failed to load embedding model: {str(e)}",
@@ -92,6 +111,7 @@ class EmbeddingService:
                             error_type=type(e).__name__
                         )
         
+        logger.debug("Model loading check completed - model is ready")
         return self.model
     
     async def generate_embeddings(
@@ -118,18 +138,31 @@ class EmbeddingService:
         if is_single_text:
             texts = [texts]
         
-        logger.debug("Starting embedding generation", 
+        logger.info("Starting embedding generation", 
                     text_count=len(texts),
-                    batch_size=batch_size)
+                    batch_size=batch_size,
+                    avg_text_length=sum(len(t) for t in texts) // len(texts))
         
         try:
+            logger.info("Submitting embedding task to thread pool",
+                       executor_active=not self.executor._shutdown,
+                       thread_count=len(self.executor._threads) if hasattr(self.executor, '_threads') else 'unknown')
+            
             # Run embedding generation in thread pool to avoid blocking
-            embeddings = await asyncio.get_event_loop().run_in_executor(
-                self.executor,
-                self._generate_embeddings_sync,
-                texts,
-                batch_size
+            # Add timeout to prevent hanging indefinitely
+            embeddings = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    self.executor,
+                    self._generate_embeddings_sync,
+                    texts,
+                    batch_size
+                ),
+                timeout=300.0  # 5 minute timeout for large batches
             )
+            
+            logger.info("Embedding generation completed successfully",
+                       embedding_count=len(embeddings),
+                       first_embedding_dim=len(embeddings[0]) if embeddings else 0)
             
             duration = time.time() - start_time
             logger.log_performance(
@@ -146,9 +179,21 @@ class EmbeddingService:
             
             return embeddings
             
+        except asyncio.TimeoutError:
+            logger.error("Embedding generation timed out",
+                        text_count=len(texts),
+                        timeout_seconds=300)
+            raise create_error(
+                EmbeddingError,
+                "Embedding generation timed out after 5 minutes",
+                "EMBEDDING_TIMEOUT",
+                text_count=len(texts)
+            )
         except Exception as e:
             logger.error(f"Embedding generation failed: {str(e)}", 
-                        text_count=len(texts))
+                        text_count=len(texts),
+                        error_type=type(e).__name__)
+            logger.exception("Full exception traceback")
             
             if isinstance(e, EmbeddingError):
                 raise
@@ -176,34 +221,88 @@ class EmbeddingService:
         Returns:
             List[List[float]]: List of embeddings
         """
-        model = self._load_model()
+        logger.info("Starting synchronous embedding generation",
+                   total_texts=len(texts),
+                   batch_size=batch_size,
+                   thread_id=threading.current_thread().name)
         
-        # Process in batches to manage memory
-        all_embeddings = []
-        
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
+        try:
+            model = self._load_model()
+            logger.info("Model loaded successfully for embedding generation")
             
-            # Generate embeddings for batch
-            batch_embeddings = model.encode(
-                batch_texts,
-                convert_to_numpy=True,
-                show_progress_bar=False,
-                batch_size=len(batch_texts)
-            )
+            # Process in batches to manage memory
+            all_embeddings = []
             
-            # Convert to list format
-            if isinstance(batch_embeddings, np.ndarray):
-                batch_embeddings = batch_embeddings.tolist()
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i + batch_size]
+                batch_num = i // batch_size + 1
+                total_batches = (len(texts) + batch_size - 1) // batch_size
+                
+                logger.info("Processing embedding batch",
+                           batch_num=batch_num,
+                           total_batches=total_batches,
+                           batch_start=i,
+                           batch_size=len(batch_texts),
+                           total_texts=len(texts))
+                
+                # Log some sample text characteristics for debugging
+                sample_text = batch_texts[0] if batch_texts else ""
+                logger.debug("Batch text sample",
+                            batch_num=batch_num,
+                            sample_length=len(sample_text),
+                            sample_preview=sample_text[:100] + "..." if len(sample_text) > 100 else sample_text)
+                
+                try:
+                    # Generate embeddings for batch
+                    logger.info("Calling model.encode for batch", batch_num=batch_num)
+                    batch_start_time = time.time()
+                    
+                    batch_embeddings = model.encode(
+                        batch_texts,
+                        convert_to_numpy=True,
+                        show_progress_bar=False,
+                        batch_size=len(batch_texts)
+                    )
+                    
+                    batch_duration = time.time() - batch_start_time
+                    logger.info("Model.encode completed for batch",
+                               batch_num=batch_num,
+                               duration_seconds=round(batch_duration, 2),
+                               embedding_shape=batch_embeddings.shape if hasattr(batch_embeddings, 'shape') else 'unknown')
+                    
+                    # Convert to list format
+                    if isinstance(batch_embeddings, np.ndarray):
+                        logger.debug("Converting numpy array to list", batch_num=batch_num)
+                        batch_embeddings = batch_embeddings.tolist()
+                        logger.debug("Conversion completed", batch_num=batch_num)
+                    
+                    all_embeddings.extend(batch_embeddings)
+                    
+                    logger.info("Batch processing completed",
+                               batch_num=batch_num,
+                               batch_embeddings_count=len(batch_embeddings),
+                               total_embeddings_so_far=len(all_embeddings))
+                               
+                except Exception as e:
+                    logger.error("Error processing embedding batch",
+                                batch_num=batch_num,
+                                error=str(e),
+                                error_type=type(e).__name__)
+                    logger.exception("Full batch processing exception")
+                    raise
             
-            all_embeddings.extend(batch_embeddings)
+            logger.info("All embedding batches completed",
+                       total_embeddings=len(all_embeddings),
+                       expected_count=len(texts))
             
-            logger.debug("Processed embedding batch",
-                        batch_start=i,
-                        batch_size=len(batch_texts),
-                        total_texts=len(texts))
-        
-        return all_embeddings
+            return all_embeddings
+            
+        except Exception as e:
+            logger.error("Synchronous embedding generation failed",
+                        error=str(e),
+                        error_type=type(e).__name__)
+            logger.exception("Full synchronous generation exception")
+            raise
     
     async def generate_query_embedding(self, query: str) -> List[float]:
         """
@@ -215,7 +314,7 @@ class EmbeddingService:
         Returns:
             List[float]: Query embedding
         """
-        logger.debug("Generating query embedding", query_length=len(query))
+        logger.info("Generating query embedding", query_length=len(query))
         return await self.generate_embeddings(query)
     
     async def generate_chunk_embeddings(self, chunks: List[str]) -> List[List[float]]:

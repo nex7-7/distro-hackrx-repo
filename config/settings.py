@@ -50,7 +50,8 @@ class Settings(BaseSettings):
     
     # Performance Configuration
     max_workers: int = Field(default=4, env="MAX_WORKERS")
-    retrieval_top_k: int = Field(default=5, env="RETRIEVAL_TOP_K")
+    retrieval_top_k: int = Field(default=30, env="RETRIEVAL_TOP_K")  # Changed to 30 for reranking
+    reranking_top_k: int = Field(default=7, env="RERANKING_TOP_K")  # Top chunks after reranking
     
     # Derived properties
     @property

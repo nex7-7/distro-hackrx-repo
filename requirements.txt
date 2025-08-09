@@ -10,7 +10,7 @@ pydantic-settings
 weaviate-client
 
 # LLM integration
-google-generativeai
+google-genai
 
 # Document processing
 pymupdf4llm
@@ -21,6 +21,10 @@ pytesseract
 
 # Embeddings
 sentence-transformers
+
+# Cross-encoder for reranking
+transformers
+torch
 
 # Utilities
 python-dotenv

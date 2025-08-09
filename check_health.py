@@ -67,6 +67,8 @@ def check_imports():
         ("weaviate", "Weaviate client"),
         ("google.generativeai", "Google AI client"),
         ("sentence_transformers", "Sentence transformers"),
+        ("transformers", "Transformers for reranking"),
+        ("torch", "PyTorch for reranking"),
         ("pydantic", "Pydantic data validation"),
     ]
     

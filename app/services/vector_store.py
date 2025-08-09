@@ -9,7 +9,7 @@ retrieving document chunks. It handles Stage 2 (chunk storage) and Stage 4
 import asyncio
 import time
 import uuid
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
@@ -423,34 +423,36 @@ class VectorStore:
     
     async def search_by_keywords(
         self, 
-        keywords: List[str], 
+        keywords: Union[List[str], str], 
         document_hash: str,
-        limit: int = None
+        limit: int = 30  # Changed default to 30 for reranking
     ) -> List[Tuple[ChunkData, float]]:
         """
         Search chunks by keywords within a specific document's collection.
         
         Args:
-            keywords: List of keywords to search for
+            keywords: List of keywords or single keyword string to search for
             document_hash: Hash of the document to search within
-            limit: Maximum number of results
+            limit: Maximum number of results (default 30 for reranking)
             
         Returns:
             List[Tuple[ChunkData, float]]: List of (chunk, relevance_score) tuples
         """
-        if limit is None:
-            limit = settings.retrieval_top_k
-        
         try:
             await self.connect()
             
+            # Handle both single string and list of keywords
+            if isinstance(keywords, str):
+                keyword_query = keywords
+            else:
+                keyword_query = " ".join(keywords)
+            
             logger.debug("Searching by keywords", 
-                        keywords=keywords,
+                        keywords=keyword_query,
                         limit=limit,
                         document_hash=document_hash)
             
             # Generate embedding for keyword query
-            keyword_query = " ".join(keywords)
             query_embedding = await embedding_service.generate_query_embedding(keyword_query)
             
             # Use vector search within the specific document

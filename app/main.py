@@ -21,6 +21,7 @@ from app.utils.logger import get_logger
 from app.utils.exceptions import RAGApplicationError
 from app.services.embedding_service import embedding_service
 from app.services.vector_store import vector_store
+from app.services.reranking_service import reranking_service
 from config.settings import settings
 
 logger = get_logger(__name__)
@@ -49,6 +50,10 @@ async def lifespan(app: FastAPI):
         # Preload embedding model
         await embedding_service.preload_model()
         logger.info("Embedding model preloaded")
+        
+        # Preload reranking model
+        await reranking_service.load_model()
+        logger.info("Reranking model preloaded")
         
         logger.info("RAG Application API started successfully")
         
@@ -234,6 +239,7 @@ async def health_check() -> Dict[str, Any]:
         # Check service statuses
         vector_stats = vector_store.get_stats()
         embedding_info = embedding_service.get_model_info()
+        reranking_info = reranking_service.get_model_info()
         
         return {
             "status": "healthy",
@@ -242,11 +248,13 @@ async def health_check() -> Dict[str, Any]:
             "services": {
                 "vector_store": vector_stats.get("status", "unknown"),
                 "embedding_service": "loaded" if embedding_info["is_loaded"] else "not_loaded",
+                "reranking_service": "loaded" if reranking_info["model_loaded"] else "not_loaded",
                 "llm_service": "available"
             },
             "metrics": {
                 "total_chunks": vector_stats.get("total_chunks", 0),
-                "embedding_dimension": embedding_info["embedding_dimension"]
+                "embedding_dimension": embedding_info["embedding_dimension"],
+                "reranking_model": reranking_info["model_name"]
             }
         }
         

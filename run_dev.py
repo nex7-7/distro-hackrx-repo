@@ -9,7 +9,7 @@ Usage:
 
 Prerequisites:
     1. Start Weaviate: docker compose up weaviate
-    2. Activate virtual environment: .venv\Scripts\Activate.ps1 (Windows)
+    2. Activate virtual environment: .venv\\Scripts\\Activate.ps1 (Windows)
     3. Install dependencies: pip install -r requirements.txt
     4. Set up .env file with required variables
 """
