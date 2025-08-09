@@ -22,7 +22,8 @@ import shutil
 import os.path
 from urllib.parse import urlparse, unquote
 from tqdm import tqdm
-import fitz  # PyMuPDF for fallback PDF parsing
+import fitz
+import extract_unstructured
 
 from fastapi import FastAPI, HTTPException, Body, Header, Depends, Security, HTTPException, APIRouter
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -261,8 +262,15 @@ async def extract_and_process_zip(api_url: str, zip_content: bytes, original_fil
 
     Supported formats include: PDF, DOCX, DOC, TXT, MD, RTF
 
+    For PDF files within the ZIP:
+    - Primary: PyMuPDF for better performance and accuracy
+    - Fallback: extract_unstructured if PyMuPDF fails
+
+    For non-PDF files within the ZIP:
+    - Uses extract_unstructured directly
+
     Parameters:
-        api_url (str): URL of the parsing API.
+        api_url (str): URL of the parsing API (legacy parameter, no longer used).
         zip_content (bytes): The content of the ZIP file.
         original_filename (str): The original filename of the ZIP file.
 
@@ -347,98 +355,70 @@ async def extract_and_process_zip(api_url: str, zip_content: bytes, original_fil
                     file_path = os.path.join(temp_dir, pdf_file)
                     file_ext = os.path.splitext(pdf_file.lower())[1]
 
-                    # Determine content type based on extension
-                    content_type = content_type_map.get(
-                        file_ext, 'application/pdf')
-
                     # Read the file content
                     with open(file_path, 'rb') as f:
-                        pdf_content = f.read()
+                        file_content = f.read()
 
                     print(
                         f"📄 Processing {file_ext.upper()} file '{pdf_file}' from ZIP")
 
-                    # Create a MultipartEncoder for the document
-                    encoder = MultipartEncoder(
-                        fields={'file': (os.path.basename(
-                            pdf_file), pdf_content, content_type)}
-                    )
-
-                    # Send the document to the parsing API
-                    print(
-                        f"➡️  Sending '{pdf_file}' from ZIP to parsing API...")
-                    log_service_event("parsing_zip_document", f"Sending document from ZIP to parsing API", {
+                    log_service_event("parsing_zip_document", f"Processing document from ZIP", {
                         "zip_id": zip_id,
                         "document_file": pdf_file,
                         "file_extension": file_ext,
-                        "content_type": content_type,
-                        "file_size_bytes": len(pdf_content)
+                        "file_size_bytes": len(file_content)
                     })
 
-                    # Parse the PDF
-                    try:
-                        response = requests.post(api_url, data=encoder, headers={
-                            'Content-Type': encoder.content_type
-                        })
-                        response.raise_for_status()
-
-                        # Extract chunks from response
-                        response_json = response.json()
-                        blocks = response_json.get('return_dict', {}).get(
-                            'result', {}).get('blocks', [])
-
-                        if blocks:
-                            pdf_chunks = [
-                                " ".join(block.get('sentences', [])) for block in blocks]
+                    # Process based on file type
+                    if file_ext.lower() == '.pdf':
+                        # Try PyMuPDF first for PDF files
+                        try:
+                            print(f"🔧 Processing PDF '{pdf_file}' with PyMuPDF...")
+                            zip_doc_id = f"{zip_id}-{pdf_file}"
+                            pdf_chunks = parse_pdf_with_pymupdf(file_content, zip_doc_id, pdf_file)
                             combined_chunks.extend(pdf_chunks)
 
-                            log_service_event("zip_document_parsed", f"Successfully parsed document from ZIP", {
+                            log_service_event("zip_document_parsed", f"Successfully parsed PDF from ZIP with PyMuPDF", {
                                 "zip_id": zip_id,
                                 "document_file": pdf_file,
                                 "file_extension": file_ext,
                                 "chunks_count": len(pdf_chunks)
                             })
-                        else:
-                            log_service_event("zip_document_empty", f"No text chunks found in document from ZIP", {
+                            print(f"✅ PyMuPDF processing successful for '{pdf_file}' from ZIP")
+
+                        except Exception as e:
+                            # Try extract_unstructured as fallback for PDF
+                            log_error("zip_pdf_parsing_error", {
                                 "zip_id": zip_id,
                                 "document_file": pdf_file,
-                                "file_extension": file_ext
+                                "file_extension": file_ext,
+                                "error": str(e)
                             })
-
-                    except Exception as e:
-                        # Log error and try PyMuPDF fallback for PDF files
-                        log_error("zip_document_parsing_error", {
-                            "zip_id": zip_id,
-                            "document_file": pdf_file,
-                            "file_extension": file_ext,
-                            "error": str(e)
-                        })
-                        print(f"⚠️ Error parsing '{pdf_file}' from ZIP: {e}")
-
-                        # Try PyMuPDF fallback for PDF files only
-                        if file_ext.lower() == '.pdf':
-                            print(
-                                f"🔄 Attempting PyMuPDF fallback for '{pdf_file}' from ZIP...")
-                            log_service_event("zip_fallback_attempt", "Attempting PyMuPDF fallback for ZIP document", {
-                                "zip_id": zip_id,
-                                "document_file": pdf_file,
-                                "original_error": str(e)
-                            })
+                            print(f"⚠️ PyMuPDF failed for '{pdf_file}' from ZIP: {e}")
+                            print(f"🔄 Attempting extract_unstructured fallback for '{pdf_file}' from ZIP...")
 
                             try:
-                                # Create a unique document ID for this ZIP document
-                                zip_doc_id = f"{zip_id}-{pdf_file}"
-                                fallback_chunks = fallback_parse_pdf_with_pymupdf(
-                                    pdf_content, zip_doc_id, pdf_file)
-                                combined_chunks.extend(fallback_chunks)
+                                # Use the existing file path for extract_unstructured
+                                chunks_data = extract_unstructured.process_document(file_path, chunk_size=500, strip_metadata=True)
+                                
+                                # Convert chunks to text strings
+                                text_chunks = []
+                                for chunk in chunks_data:
+                                    chunk_text = ""
+                                    for element in chunk:
+                                        if isinstance(element, dict) and 'text' in element:
+                                            chunk_text += element['text'] + " "
+                                    if chunk_text.strip():
+                                        text_chunks.append(chunk_text.strip())
+                                
+                                combined_chunks.extend(text_chunks)
 
-                                log_service_event("zip_fallback_success", f"Successfully parsed ZIP document with PyMuPDF fallback", {
+                                log_service_event("zip_fallback_success", f"Successfully parsed ZIP PDF with extract_unstructured fallback", {
                                     "zip_id": zip_id,
                                     "document_file": pdf_file,
-                                    "chunks_count": len(fallback_chunks)
+                                    "chunks_count": len(text_chunks)
                                 })
-                                print(
-                                    f"✅ PyMuPDF fallback successful for '{pdf_file}' from ZIP")
+                                print(f"✅ extract_unstructured fallback successful for '{pdf_file}' from ZIP")
 
                             except Exception as fallback_error:
                                 log_error("zip_fallback_failed", {
@@ -447,11 +427,42 @@ async def extract_and_process_zip(api_url: str, zip_content: bytes, original_fil
                                     "fallback_error": str(fallback_error),
                                     "original_error": str(e)
                                 })
-                                print(
-                                    f"❌ PyMuPDF fallback also failed for '{pdf_file}' from ZIP: {fallback_error}")
+                                print(f"❌ Both PyMuPDF and extract_unstructured failed for '{pdf_file}' from ZIP: {fallback_error}")
                                 continue
-                        else:
-                            # For non-PDF files, just continue with next document
+                    else:
+                        # For non-PDF files, use extract_unstructured directly
+                        try:
+                            print(f"� Processing {file_ext.upper()} '{pdf_file}' with extract_unstructured...")
+                            chunks_data = extract_unstructured.process_document(file_path, chunk_size=500, strip_metadata=True)
+                            
+                            # Convert chunks to text strings
+                            text_chunks = []
+                            for chunk in chunks_data:
+                                chunk_text = ""
+                                for element in chunk:
+                                    if isinstance(element, dict) and 'text' in element:
+                                        chunk_text += element['text'] + " "
+                                if chunk_text.strip():
+                                    text_chunks.append(chunk_text.strip())
+                            
+                            combined_chunks.extend(text_chunks)
+
+                            log_service_event("zip_document_parsed", f"Successfully parsed {file_ext} document from ZIP", {
+                                "zip_id": zip_id,
+                                "document_file": pdf_file,
+                                "file_extension": file_ext,
+                                "chunks_count": len(text_chunks)
+                            })
+                            print(f"✅ extract_unstructured processing successful for '{pdf_file}' from ZIP")
+
+                        except Exception as e:
+                            log_error("zip_document_parsing_error", {
+                                "zip_id": zip_id,
+                                "document_file": pdf_file,
+                                "file_extension": file_ext,
+                                "error": str(e)
+                            })
+                            print(f"❌ extract_unstructured failed for '{pdf_file}' from ZIP: {e}")
                             continue
 
         except zipfile.BadZipFile as e:
@@ -480,23 +491,27 @@ async def extract_and_process_zip(api_url: str, zip_content: bytes, original_fil
     return combined_chunks
 
 
+
+
 async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
     """
     Downloads and processes document files for text extraction.
 
     Supported formats:
-    - PDF (.pdf)
-    - Word Documents (.docx, .doc)
-    - Text Files (.txt)
-    - Markdown Files (.md)
-    - Rich Text Format (.rtf)
+    - PDF (.pdf) - processed with PyMuPDF as primary, extract_unstructured as fallback
+    - Word Documents (.docx, .doc) - processed with extract_unstructured
+    - Text Files (.txt) - processed with extract_unstructured
+    - Markdown Files (.md) - processed with extract_unstructured
+    - Rich Text Format (.rtf) - processed with extract_unstructured
     - ZIP archives containing any of the above formats
 
-    If the file is a supported document, sends it to the parsing API to extract text.
+    For PDF files, PyMuPDF is used as the primary parser for better performance and accuracy.
+    If PyMuPDF fails, extract_unstructured is used as a fallback.
+    For non-PDF files, extract_unstructured is used directly.
     If the file is a ZIP archive, extracts it and processes all supported documents inside.
 
     Parameters:
-        api_url (str): URL of the parsing API.
+        api_url (str): URL of the parsing API (legacy parameter, no longer used).
         file_url (str): URL of the file to download.
 
     Returns:
@@ -585,163 +600,122 @@ async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
             "extension": file_extension
         })
 
-    encoder = MultipartEncoder(
-        fields={'file': (filename, file_response.content, content_type)})
-
-    print(f"➡️  Sending '{filename}' to parsing API at {api_url}...")
-    log_service_event("parsing_start", f"Sending document to parsing API", {
-        "document_id": document_id,
-        "filename": filename,
-        "api": api_url,
-        "file_size_bytes": len(file_response.content)
-    })
-
-    try:
-        parsing_start = time.time()
-        response = requests.post(api_url, data=encoder, headers={
-                                 'Content-Type': encoder.content_type})
-        response.raise_for_status()
-        parsing_time = time.time() - parsing_start
-
-        # Log parsing API response metrics
-        log_service_event("parsing_response_received", "Received response from parsing API", {
-            "document_id": document_id,
-            "status_code": response.status_code,
-            "parsing_time_seconds": parsing_time,
-            "response_size_bytes": len(response.content)
-        })
-    except requests.RequestException as e:
-        error_msg = f"Document parsing service failed: {e}"
-        log_error("parsing_failed", {
-            "document_id": document_id,
-            "api": api_url,
-            "error": str(e),
-            "elapsed_time": time.time() - start_time
-        })
-
-        # Try PyMuPDF fallback for PDF files only
-        if file_extension.lower() == '.pdf':
-            print(
-                f"⚠️ Parsing service failed for '{filename}', attempting PyMuPDF fallback...")
-            log_service_event("attempting_fallback", "Parsing service failed, attempting PyMuPDF fallback", {
+    if file_extension == ".pdf":
+        try:
+            log_service_event("parsing_started", "Parsing with PyMuPDF", {
                 "document_id": document_id,
-                "filename": filename,
-                "original_error": str(e)
             })
 
+            return parse_pdf_with_pymupdf(file_response.content, document_id, filename)
+        
+        except Exception as e:
+            error_msg = f"PyMuPDF parsing failed: {e}"
+            log_error("parsing_failed", {
+                "document_id": document_id,
+                "error": str(e),
+                "elapsed_time": time.time() - start_time
+            })
+            print(f"⚠️ PyMuPDF parsing failed for '{filename}': {e}")
+            print(f"🔄 Attempting fallback with extract_unstructured for '{filename}'...")
+            
+            # Try extract_unstructured as fallback
             try:
-                return fallback_parse_pdf_with_pymupdf(file_response.content, document_id, filename)
-            except HTTPException:
-                # Re-raise the HTTPException from fallback function
-                raise
+                # Create a temporary file for extract_unstructured to process
+                with tempfile.NamedTemporaryFile(suffix=file_extension, delete=False) as temp_file:
+                    temp_file.write(file_response.content)
+                    temp_file_path = temp_file.name
+                
+                try:
+                    # Process with extract_unstructured
+                    chunks_data = extract_unstructured.process_document(temp_file_path, chunk_size=500, strip_metadata=True)
+                    
+                    # Convert chunks to text strings
+                    text_chunks = []
+                    for chunk in chunks_data:
+                        chunk_text = ""
+                        for element in chunk:
+                            if isinstance(element, dict) and 'text' in element:
+                                chunk_text += element['text'] + " "
+                        if chunk_text.strip():
+                            text_chunks.append(chunk_text.strip())
+                    
+                    log_service_event("fallback_parsing_success", "Successfully parsed with extract_unstructured", {
+                        "document_id": document_id,
+                        "filename": filename,
+                        "chunks_count": len(text_chunks)
+                    })
+                    print(f"✅ extract_unstructured fallback successful for '{filename}'")
+                    return text_chunks
+                
+                finally:
+                    # Clean up temporary file
+                    try:
+                        os.unlink(temp_file_path)
+                    except Exception:
+                        pass
+                        
             except Exception as fallback_error:
-                log_error("fallback_unexpected_error", {
+                log_error("fallback_parsing_failed", {
                     "document_id": document_id,
                     "filename": filename,
                     "fallback_error": str(fallback_error),
                     "original_error": str(e)
                 })
-                # If fallback also fails, raise the original parsing service error
-                raise HTTPException(status_code=503, detail=error_msg)
-        else:
-            # For non-PDF files, just raise the original error
-            raise HTTPException(status_code=503, detail=error_msg)
-
-    # Parse the response and log structure details
-    try:
-        response_json = response.json()
-
-        # Log parsed response structure (without full content)
-        structure_details = {
-            "document_id": document_id,
-            "has_return_dict": "return_dict" in response_json,
-            "has_result": "result" in response_json.get("return_dict", {}),
-            "has_blocks": "blocks" in response_json.get("return_dict", {}).get("result", {})
-        }
-
-        # Add additional structure information if available
-        if "return_dict" in response_json and "result" in response_json.get("return_dict", {}):
-            result = response_json.get("return_dict", {}).get("result", {})
-            structure_details.update({
-                "metadata_keys": list(result.keys()) if isinstance(result, dict) else [],
-                "has_metadata": "metadata" in result if isinstance(result, dict) else False,
-                "pages_count": len(result.get("pages", [])) if isinstance(result, dict) else 0
+                raise HTTPException(status_code=503, detail=f"Both PyMuPDF and extract_unstructured parsing failed: {fallback_error}")
+    else:
+        # For non-PDF files, use extract_unstructured directly
+        try:
+            # Create a temporary file for extract_unstructured to process
+            with tempfile.NamedTemporaryFile(suffix=file_extension, delete=False) as temp_file:
+                temp_file.write(file_response.content)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Process with extract_unstructured
+                chunks_data = extract_unstructured.process_document(temp_file_path, chunk_size=500, strip_metadata=True)
+                
+                # Convert chunks to text strings
+                text_chunks = []
+                for chunk in chunks_data:
+                    chunk_text = ""
+                    for element in chunk:
+                        if isinstance(element, dict) and 'text' in element:
+                            chunk_text += element['text'] + " "
+                    if chunk_text.strip():
+                        text_chunks.append(chunk_text.strip())
+                
+                log_service_event("non_pdf_parsing_success", f"Successfully parsed {file_extension} file with extract_unstructured", {
+                    "document_id": document_id,
+                    "filename": filename,
+                    "file_extension": file_extension,
+                    "chunks_count": len(text_chunks)
+                })
+                print(f"✅ extract_unstructured parsing successful for '{filename}'")
+                return text_chunks
+            
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_file_path)
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            log_error("non_pdf_parsing_failed", {
+                "document_id": document_id,
+                "filename": filename,
+                "file_extension": file_extension,
+                "error": str(e)
             })
-
-        log_service_event("parsing_result_structure",
-                          "Structure of parsing result", structure_details)
-    except Exception as e:
-        error_msg = f"Failed to parse API response: {e}"
-        log_error("parsing_response_parse_error", {
-            "document_id": document_id,
-            "error": str(e)
-        })
-        raise HTTPException(status_code=500, detail=error_msg)
-
-    # Extract blocks from the response
-    blocks = response_json.get('return_dict', {}).get(
-        'result', {}).get('blocks', [])
-
-    if not blocks:
-        error_msg = "No text chunks were found in the parsed document."
-        log_error("no_text_chunks", {
-            "document_id": document_id,
-            "filename": filename
-        })
-        raise HTTPException(status_code=422, detail=error_msg)
-
-    # Extract and analyze chunk texts
-    chunk_texts = [" ".join(block.get('sentences', [])) for block in blocks]
-
-    # Calculate chunk statistics
-    chunk_lengths = [len(chunk) for chunk in chunk_texts]
-    chunk_word_counts = [len(chunk.split()) for chunk in chunk_texts]
-
-    # Log detailed chunk statistics
-    log_service_event("chunks_extracted", "Extracted raw text chunks from document", {
-        "document_id": document_id,
-        "raw_chunks_count": len(chunk_texts),
-        "total_chars": sum(chunk_lengths),
-        "total_words": sum(chunk_word_counts),
-        "chars_statistics": {
-            "min": min(chunk_lengths) if chunk_lengths else 0,
-            "max": max(chunk_lengths) if chunk_lengths else 0,
-            "mean": sum(chunk_lengths) / len(chunk_lengths) if chunk_lengths else 0
-        },
-        "words_statistics": {
-            "min": min(chunk_word_counts) if chunk_word_counts else 0,
-            "max": max(chunk_word_counts) if chunk_word_counts else 0,
-            "mean": sum(chunk_word_counts) / len(chunk_word_counts) if chunk_word_counts else 0
-        },
-        "short_chunks": sum(1 for length in chunk_lengths if length < 100),
-        "medium_chunks": sum(1 for length in chunk_lengths if 100 <= length < 500),
-        "long_chunks": sum(1 for length in chunk_lengths if length >= 500)
-    })
-
-    # Log sample of first few chunks for debugging (only log first 3 chunks to avoid excessive logging)
-    for i, chunk in enumerate(chunk_texts[:3]):
-        preview = chunk[:100] + ("..." if len(chunk) > 100 else "")
-        log_service_event("chunk_sample", f"Sample of extracted chunk {i+1}", {
-            "document_id": document_id,
-            "chunk_index": i,
-            "chunk_length": len(chunk),
-            "word_count": len(chunk.split()),
-            "preview": preview
-        })
-
-    print(f"✅ Parsed document into {len(chunk_texts)} text chunks.")
-    log_service_event("parsing_complete", f"Document parsed successfully", {
-        "document_id": document_id,
-        "chunks_count": len(chunk_texts),
-        "avg_chunk_length": sum(chunk_lengths) / len(chunk_lengths) if chunk_lengths else 0,
-        "total_processing_time": time.time() - start_time
-    })
-    return chunk_texts
+            raise HTTPException(status_code=503, detail=f"extract_unstructured parsing failed for {file_extension} file: {e}")
 
 
-def fallback_parse_pdf_with_pymupdf(pdf_content: bytes, document_id: str, filename: str) -> List[str]:
+def parse_pdf_with_pymupdf(pdf_content: bytes, document_id: str, filename: str) -> List[str]:
     """
-    Fallback function to parse PDF using PyMuPDF when the main parsing service fails.
+    Primary function to parse PDF using PyMuPDF for text extraction.
+
+    This function is the preferred method for PDF parsing due to its superior
+    performance and accuracy compared to API-based parsing services.
 
     Parameters:
         pdf_content (bytes): The PDF file content as bytes
@@ -752,17 +726,17 @@ def fallback_parse_pdf_with_pymupdf(pdf_content: bytes, document_id: str, filena
         List[str]: List of text chunks extracted from the PDF
 
     Raises:
-        HTTPException: If PyMuPDF parsing also fails
+        HTTPException: If PyMuPDF parsing fails
     """
-    fallback_start_time = time.time()
+    parsing_start_time = time.time()
 
     print(
-        f"🔄 Attempting fallback PDF parsing with PyMuPDF for '{filename}'...")
-    log_service_event("fallback_parsing_start", "Starting fallback PDF parsing with PyMuPDF", {
+        f"� Parsing PDF with PyMuPDF for '{filename}'...")
+    log_service_event("primary_parsing_start", "Starting primary PDF parsing with PyMuPDF", {
         "document_id": document_id,
         "filename": filename,
         "pdf_size_bytes": len(pdf_content),
-        "fallback_method": "PyMuPDF"
+        "parsing_method": "PyMuPDF"
     })
 
     try:
@@ -788,7 +762,7 @@ def fallback_parse_pdf_with_pymupdf(pdf_content: bytes, document_id: str, filena
             pdf_doc.close()
 
             # Log extraction results
-            log_service_event("fallback_text_extracted", "Extracted text using PyMuPDF", {
+            log_service_event("primary_text_extracted", "Extracted text using PyMuPDF", {
                 "document_id": document_id,
                 "pages_processed": total_pages,
                 "pages_with_text": len(page_texts),
@@ -808,8 +782,8 @@ def fallback_parse_pdf_with_pymupdf(pdf_content: bytes, document_id: str, filena
                 })
 
         if not page_texts:
-            error_msg = "No text could be extracted from the PDF using PyMuPDF fallback."
-            log_error("fallback_no_text_extracted", {
+            error_msg = "No text could be extracted from the PDF using PyMuPDF."
+            log_error("primary_no_text_extracted", {
                 "document_id": document_id,
                 "filename": filename,
                 "pages_count": total_pages if 'total_pages' in locals() else 0
@@ -859,16 +833,16 @@ def fallback_parse_pdf_with_pymupdf(pdf_content: bytes, document_id: str, filena
         chunk_texts = [
             chunk for chunk in chunk_texts if len(chunk.strip()) > 50]
 
-        fallback_time = time.time() - fallback_start_time
+        parsing_time = time.time() - parsing_start_time
 
-        # Log successful fallback parsing
-        log_service_event("fallback_parsing_complete", "Successfully parsed PDF with PyMuPDF fallback", {
+        # Log successful parsing
+        log_service_event("primary_parsing_complete", "Successfully parsed PDF with PyMuPDF", {
             "document_id": document_id,
             "filename": filename,
             "chunks_extracted": len(chunk_texts),
             "total_chars": sum(len(chunk) for chunk in chunk_texts),
             "avg_chunk_length": sum(len(chunk) for chunk in chunk_texts) / len(chunk_texts) if chunk_texts else 0,
-            "fallback_time_seconds": fallback_time,
+            "parsing_time_seconds": parsing_time,
             "chunk_size_distribution": {
                 "short_chunks": sum(1 for chunk in chunk_texts if len(chunk) < 200),
                 "medium_chunks": sum(1 for chunk in chunk_texts if 200 <= len(chunk) < 500),
@@ -877,16 +851,16 @@ def fallback_parse_pdf_with_pymupdf(pdf_content: bytes, document_id: str, filena
         })
 
         print(
-            f"✅ PyMuPDF fallback extracted {len(chunk_texts)} text chunks from '{filename}'")
+            f"✅ PyMuPDF extracted {len(chunk_texts)} text chunks from '{filename}'")
         return chunk_texts
 
     except Exception as e:
-        error_msg = f"PyMuPDF fallback parsing also failed: {e}"
-        log_error("fallback_parsing_failed", {
+        error_msg = f"PyMuPDF parsing failed: {e}"
+        log_error("primary_parsing_failed", {
             "document_id": document_id,
             "filename": filename,
             "error": str(e),
-            "fallback_time_seconds": time.time() - fallback_start_time
+            "parsing_time_seconds": time.time() - parsing_start_time
         })
         raise HTTPException(status_code=503, detail=error_msg)
 
