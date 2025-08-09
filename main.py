@@ -417,8 +417,63 @@ async def process_document_and_answer_questions(
         # Create HTTP client session for making requests
         async with httpx.AsyncClient() as http_client:
             # 1. Ingest document (new engine) -> list[str] chunks
-            chunks = ingest_from_url(document_url)
-            print(f"📝 Ingested {len(chunks)} initial text chunks.")
+            try:
+                chunks = ingest_from_url(document_url)
+                print(f"📝 Ingested {len(chunks)} initial text chunks.")
+            except HTTPException as he:
+                # Handle security violations and file processing errors
+                log_error("document_ingestion_failed", {
+                    "document_url": document_url,
+                    "request_id": request_id,
+                    "status_code": he.status_code,
+                    "detail": he.detail
+                })
+                print(f"❌ Document ingestion failed: {he.detail}")
+                
+                # Return "Files Not found" for security violations or processing errors
+                answers = ["Files Not found"] * len(questions)
+                
+                processing_time = time.time() - start_time
+                log_api_response(
+                    endpoint="/api/v1/hackrx/run",
+                    response_data={
+                        "answers_count": len(answers),
+                        "processing_time": processing_time,
+                        "request_id": request_id,
+                        "status_code": 200,
+                        "ingestion_failed": True,
+                        "failure_reason": he.detail
+                    },
+                    duration=processing_time
+                )
+                
+                return QueryResponse(answers=answers)
+
+            # Check if any valid content was found
+            if not chunks:
+                log_service_event("no_content_found", "No valid content found in document", {
+                    "document_url": document_url,
+                    "request_id": request_id
+                })
+                print("❌ No valid content found in the document.")
+                
+                # Return "Files Not found" for all questions
+                answers = ["Files Not found"] * len(questions)
+                
+                processing_time = time.time() - start_time
+                log_api_response(
+                    endpoint="/api/v1/hackrx/run",
+                    response_data={
+                        "answers_count": len(answers),
+                        "processing_time": processing_time,
+                        "request_id": request_id,
+                        "status_code": 200,
+                        "no_content_found": True
+                    },
+                    duration=processing_time
+                )
+                
+                return QueryResponse(answers=answers)
 
             # 2. Semantic chunking
             chunks = semantic_chunk_texts(
@@ -430,6 +485,32 @@ async def process_document_and_answer_questions(
                 max_chunk_size=12
             )
             print(f"🧩 After semantic chunking: {len(chunks)} chunks.")
+
+            # Check again after semantic chunking
+            if not chunks:
+                log_service_event("no_content_after_chunking", "No valid content after semantic chunking", {
+                    "document_url": document_url,
+                    "request_id": request_id
+                })
+                print("❌ No valid content found after semantic chunking.")
+                
+                # Return "Files Not found" for all questions
+                answers = ["Files Not found"] * len(questions)
+                
+                processing_time = time.time() - start_time
+                log_api_response(
+                    endpoint="/api/v1/hackrx/run",
+                    response_data={
+                        "answers_count": len(answers),
+                        "processing_time": processing_time,
+                        "request_id": request_id,
+                        "status_code": 200,
+                        "no_content_after_chunking": True
+                    },
+                    duration=processing_time
+                )
+                
+                return QueryResponse(answers=answers)
 
             # 3. Use global Weaviate client or connect if not available
             global weaviate_client

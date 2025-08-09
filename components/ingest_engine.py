@@ -671,6 +671,94 @@ def _legacy_parse_pptx_file(file_path: str, source_url: str) -> List[str]:
     return chunks
 
 
+# ------------------------------ File Security Configuration ------------------------------
+
+# Maximum file size allowed (50MB in bytes)
+MAX_FILE_SIZE_BYTES = 1000 * 1024 * 1024  # 1GB
+
+# Blacklisted file extensions that should not be processed
+BLACKLISTED_EXTENSIONS = {
+    "bin", "exe", "dll", "so", "dylib", "app", "deb", "rpm",
+    "msi", "dmg", "pkg", "run", "tar", "gz", "bz2", "xz", "7z", "rar"
+}
+
+# Maximum ZIP extraction depth to prevent recursive ZIP bombs
+MAX_ZIP_DEPTH = 1
+
+# ------------------------------ Security Functions ------------------------------
+
+def _check_file_security(file_path: str, current_zip_depth: int = 0) -> bool:
+    """
+    Check if a file is safe to process based on security constraints.
+    
+    Parameters:
+        file_path (str): Path to the file to check
+        current_zip_depth (int): Current depth of ZIP extraction (0 = not in ZIP)
+    
+    Returns:
+        bool: True if file is safe to process, False otherwise
+    
+    Raises:
+        HTTPException: If file violates security constraints
+    """
+    # Check file size
+    try:
+        file_size = os.path.getsize(file_path)
+        if file_size > MAX_FILE_SIZE_BYTES:
+            log_error("file_too_large", {
+                "file_path": file_path,
+                "size_bytes": file_size,
+                "max_size_bytes": MAX_FILE_SIZE_BYTES,
+                "size_mb": file_size / (1024 * 1024)
+            })
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large: {file_size / (1024 * 1024):.1f}MB. Maximum allowed: {MAX_FILE_SIZE_BYTES / (1024 * 1024)}MB"
+            )
+    except OSError as e:
+        log_error("file_size_check_failed", {
+            "file_path": file_path,
+            "error": str(e)
+        })
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot access file: {e}"
+        )
+    
+    # Check file extension against blacklist
+    ext = os.path.splitext(file_path)[1].lower().lstrip('.')
+    if ext in BLACKLISTED_EXTENSIONS:
+        log_error("blacklisted_file_type", {
+            "file_path": file_path,
+            "extension": ext,
+            "blacklisted_extensions": list(BLACKLISTED_EXTENSIONS)
+        })
+        raise HTTPException(
+            status_code=415,
+            detail=f"File type '.{ext}' is not allowed for security reasons"
+        )
+    
+    # Check ZIP depth to prevent recursive ZIP bombs
+    if ext == "zip" and current_zip_depth >= MAX_ZIP_DEPTH:
+        log_error("recursive_zip_blocked", {
+            "file_path": file_path,
+            "current_depth": current_zip_depth,
+            "max_depth": MAX_ZIP_DEPTH
+        })
+        raise HTTPException(
+            status_code=422,
+            detail=f"Recursive ZIP files not allowed. Maximum extraction depth: {MAX_ZIP_DEPTH}"
+        )
+    
+    log_service_event("file_security_check_passed", "File passed security checks", {
+        "file_path": file_path,
+        "extension": ext,
+        "size_bytes": file_size,
+        "zip_depth": current_zip_depth
+    })
+    
+    return True
+
 # ------------------------------ Parser Registry ------------------------------
 Parser_Registry: Dict[str, Callable[[str, str], List[str]]] = {
     "xlsx": parse_spreadsheet,
@@ -692,90 +780,304 @@ def _is_url(path_or_url: str) -> bool:
 
 
 def _download_to_temp(url: str) -> str:
+    """Download a file from URL to temporary storage with security checks.
+    
+    Parameters:
+        url (str): URL to download from
+    
+    Returns:
+        str: Path to the downloaded temporary file
+        
+    Raises:
+        HTTPException: If download fails or file violates security constraints
+    """
     dl_id = str(uuid.uuid4())
     log_service_event("download_start", "Starting file download", {
         "url": url,
         "download_id": dl_id
     })
+    
     try:
-        resp = requests.get(url, timeout=60)
+        # Download with streaming to check size during download
+        resp = requests.get(url, timeout=60, stream=True)
         resp.raise_for_status()
-    except Exception as e:
+        
+        # Check Content-Length header if available
+        content_length = resp.headers.get('content-length')
+        if content_length and int(content_length) > MAX_FILE_SIZE_BYTES:
+            log_error("download_file_too_large", {
+                "url": url,
+                "content_length": int(content_length),
+                "max_size_bytes": MAX_FILE_SIZE_BYTES
+            })
+            raise HTTPException(
+                status_code=413,
+                detail=f"Remote file too large: {int(content_length) / (1024 * 1024):.1f}MB. Maximum allowed: {MAX_FILE_SIZE_BYTES / (1024 * 1024)}MB"
+            )
+        
+        # Determine file extension from URL
+        name = os.path.basename(unquote(urlparse(url).path)) or f"file_{dl_id}"
+        suffix = os.path.splitext(name)[1] or ''
+        
+        # Check if extension is blacklisted before downloading
+        ext = suffix.lower().lstrip('.')
+        if ext in BLACKLISTED_EXTENSIONS:
+            log_error("download_blacklisted_extension", {
+                "url": url,
+                "extension": ext,
+                "filename": name
+            })
+            raise HTTPException(
+                status_code=415,
+                detail=f"File type '.{ext}' is not allowed for security reasons"
+            )
+        
+        # Create temporary file
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="ingest_", suffix=suffix)
+        
+        # Download with size checking
+        downloaded_bytes = 0
+        chunk_size = 8192
+        
+        try:
+            with os.fdopen(tmp_fd, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        downloaded_bytes += len(chunk)
+                        
+                        # Check size limit during download
+                        if downloaded_bytes > MAX_FILE_SIZE_BYTES:
+                            log_error("download_size_limit_exceeded", {
+                                "url": url,
+                                "downloaded_bytes": downloaded_bytes,
+                                "max_size_bytes": MAX_FILE_SIZE_BYTES
+                            })
+                            raise HTTPException(
+                                status_code=413,
+                                detail=f"File too large during download: {downloaded_bytes / (1024 * 1024):.1f}MB. Maximum allowed: {MAX_FILE_SIZE_BYTES / (1024 * 1024)}MB"
+                            )
+                        
+                        f.write(chunk)
+        except HTTPException:
+            # Clean up temp file on error
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        
+    except requests.exceptions.RequestException as e:
         log_error("download_failed", {"url": url, "error": str(e)})
         raise HTTPException(
             status_code=400, detail=f"Failed to download file: {e}")
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        log_error("download_unexpected_error", {"url": url, "error": str(e)})
+        raise HTTPException(
+            status_code=500, detail=f"Unexpected error during download: {e}")
 
-    name = os.path.basename(unquote(urlparse(url).path)) or f"file_{dl_id}"
-    suffix = os.path.splitext(name)[1] or ''
-    tmp_fd, tmp_path = tempfile.mkstemp(prefix="ingest_", suffix=suffix)
-    with os.fdopen(tmp_fd, 'wb') as f:
-        f.write(resp.content)
-
-    log_service_event("download_complete", "File downloaded", {
+    log_service_event("download_complete", "File downloaded successfully", {
         "url": url,
         "path": tmp_path,
-        "bytes": len(resp.content)
+        "bytes": downloaded_bytes,
+        "download_id": dl_id
     })
     return tmp_path
 
 
-def handle_zip_file(zip_path: str, source_url: str) -> List[str]:
+def handle_zip_file(zip_path: str, source_url: str, current_zip_depth: int = 0) -> List[str]:
+    """
+    Handle ZIP file extraction with security checks and depth limits.
+    
+    Parameters:
+        zip_path (str): Path to the ZIP file
+        source_url (str): Original source URL for logging
+        current_zip_depth (int): Current depth of ZIP extraction
+    
+    Returns:
+        List[str]: Combined chunks from all files in the ZIP
+    """
     zip_id = str(uuid.uuid4())
     start = time.time()
+    
+    # Check ZIP depth before processing
+    if current_zip_depth >= MAX_ZIP_DEPTH:
+        log_error("max_zip_depth_exceeded", {
+            "zip_id": zip_id,
+            "zip_path": zip_path,
+            "current_depth": current_zip_depth,
+            "max_depth": MAX_ZIP_DEPTH
+        })
+        raise HTTPException(
+            status_code=422, 
+            detail=f"Maximum ZIP extraction depth ({MAX_ZIP_DEPTH}) exceeded. Recursive ZIPs not allowed."
+        )
+    
     log_service_event("zip_extraction_start", "Extracting ZIP", {
         "zip_id": zip_id,
-        "zip_path": zip_path
+        "zip_path": zip_path,
+        "extraction_depth": current_zip_depth
     })
+    
     combined: List[str] = []
+    processable_files_found = False
+    
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
-                zf.extractall(temp_dir)
+                # Check for suspicious ZIP structure before extraction
                 members = zf.namelist()
-            log_service_event("zip_extracted", "ZIP extracted", {
+                
+                # Filter out suspicious files and check for depth issues
+                safe_members = []
+                for member in members:
+                    # Skip hidden/system files
+                    if any(part.startswith('.') or part.startswith('__MACOSX') for part in member.split('/')):
+                        continue
+                    
+                    # Check if this is a nested ZIP
+                    if member.lower().endswith('.zip') and current_zip_depth >= MAX_ZIP_DEPTH - 1:
+                        log_service_event("nested_zip_skipped", "Skipping nested ZIP due to depth limit", {
+                            "zip_id": zip_id,
+                            "nested_zip": member,
+                            "current_depth": current_zip_depth
+                        })
+                        continue
+                    
+                    safe_members.append(member)
+                
+                if not safe_members:
+                    log_service_event("zip_no_processable_files", "No processable files found in ZIP", {
+                        "zip_id": zip_id,
+                        "total_members": len(members),
+                        "safe_members": 0
+                    })
+                    return []
+                
+                # Extract only safe members
+                for member in safe_members:
+                    try:
+                        zf.extract(member, temp_dir)
+                    except Exception as e:
+                        log_error("zip_member_extraction_failed", {
+                            "zip_id": zip_id,
+                            "member": member,
+                            "error": str(e)
+                        })
+                        continue
+                
+            log_service_event("zip_extracted", "ZIP extracted successfully", {
                 "zip_id": zip_id,
-                "file_count": len(members),
-                "files_sample": members[:10]
+                "total_members": len(members),
+                "safe_members": len(safe_members),
+                "extraction_depth": current_zip_depth
             })
+            
         except zipfile.BadZipFile as e:
             log_error("invalid_zip", {"zip_path": zip_path, "error": str(e)})
             raise HTTPException(
                 status_code=422, detail=f"Invalid ZIP file: {e}")
+        except Exception as e:
+            log_error("zip_extraction_failed", {
+                "zip_id": zip_id,
+                "zip_path": zip_path,
+                "error": str(e)
+            })
+            raise HTTPException(
+                status_code=500, detail=f"Failed to extract ZIP: {e}")
 
+        # Process extracted files
         for root, _, files in os.walk(temp_dir):
             for fname in files:
-                if fname.startswith("._"):
+                if fname.startswith("._"):  # Skip macOS metadata files
                     continue
+                
                 fpath = os.path.join(root, fname)
+                
                 try:
+                    # Check file security before processing
+                    _check_file_security(fpath, current_zip_depth + 1)
+                    
+                    # Determine if this is a processable file type
+                    ext = os.path.splitext(fname.lower())[1].lstrip('.')
+                    if ext in Parser_Registry or ext == 'zip':
+                        processable_files_found = True
+                    
+                    # Process the file
                     chunks = ingest_from_url(
-                        fpath, _is_recursive=True, _source_url=source_url)
+                        fpath, 
+                        _is_recursive=True, 
+                        _source_url=source_url,
+                        _current_zip_depth=current_zip_depth + 1
+                    )
                     combined.extend(chunks)
+                    
+                except HTTPException as he:
+                    # Re-raise HTTP exceptions (these are security violations)
+                    if he.status_code in [413, 415, 422]:  # File too large, blacklisted, or recursive ZIP
+                        raise he
+                    else:
+                        log_error("zip_member_security_check_failed", {
+                            "zip_id": zip_id,
+                            "member": fname,
+                            "error": str(he)
+                        })
+                        continue
                 except Exception as e:
                     log_error("zip_member_ingest_failed", {
                         "zip_id": zip_id,
                         "member": fname,
                         "error": str(e)
                     })
-        log_service_event("zip_processing_complete", "ZIP processed", {
+                    continue
+        
+        # Check if we found any processable content
+        if not processable_files_found or not combined:
+            log_service_event("zip_no_content_extracted", "No valid content extracted from ZIP", {
+                "zip_id": zip_id,
+                "processable_files_found": processable_files_found,
+                "chunks_extracted": len(combined)
+            })
+            # Return empty list which will trigger "Files Not found" response
+            return []
+        
+        log_service_event("zip_processing_complete", "ZIP processed successfully", {
             "zip_id": zip_id,
             "total_chunks": len(combined),
-            "elapsed": time.time() - start
+            "processable_files_found": processable_files_found,
+            "elapsed": time.time() - start,
+            "extraction_depth": current_zip_depth
         })
+        
     return combined
 
 # ------------------------------ Main Engine ------------------------------
 
 
-def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_url: Optional[str] = None) -> List[str]:
+def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_url: Optional[str] = None, _current_zip_depth: int = 0) -> List[str]:
     """Ingest a document (remote URL or local path) and return list[str] chunks.
 
     Implements required steps:
       1. Download file if remote
-      2. Detect extension
-      3. If ZIP -> recurse into contents
-      4. Route to parser via registry
-      5. Execute parser & collect chunks
+      2. Security checks (file size, type, depth)
+      3. Detect extension
+      4. If ZIP -> recurse into contents (with depth limits)
+      5. Route to parser via registry
+      6. Execute parser & collect chunks
+    
+    Parameters:
+        url_or_path (str): URL or local file path to process
+        _is_recursive (bool): Internal flag indicating recursive call
+        _source_url (Optional[str]): Original source URL for logging
+        _current_zip_depth (int): Current ZIP extraction depth
+    
+    Returns:
+        List[str]: List of text chunks extracted from the document
+        
+    Raises:
+        HTTPException: For security violations or processing errors
     """
     original_input = url_or_path
     start = time.time()
@@ -784,43 +1086,112 @@ def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_ur
     source_url = _source_url or (url_or_path if _is_url(url_or_path) else None)
 
     try:
+        # Step 1: Download file if remote
         if not is_local:
             temp_path = _download_to_temp(url_or_path)
         else:
             temp_path = url_or_path
 
+        # Step 2: Security checks
+        try:
+            _check_file_security(temp_path, _current_zip_depth)
+        except HTTPException as he:
+            # For security violations, log and re-raise
+            log_error("file_security_violation", {
+                "input": original_input,
+                "file_path": temp_path,
+                "zip_depth": _current_zip_depth,
+                "status_code": he.status_code,
+                "detail": he.detail
+            })
+            raise he
+
+        # Step 3: Detect file extension
         ext = os.path.splitext(temp_path)[1].lower().lstrip('.')
         log_service_event("file_type_detected", "Detected file type", {
             "input": original_input,
             "local_path": temp_path,
-            "extension": ext or "(none)"
+            "extension": ext or "(none)",
+            "zip_depth": _current_zip_depth
         })
 
+        # Step 4: Handle ZIP files with depth checking
         if ext == 'zip':
-            chunks = handle_zip_file(temp_path, source_url or original_input)
+            chunks = handle_zip_file(temp_path, source_url or original_input, _current_zip_depth)
+            
+            # Check if ZIP processing found any valid content
+            if not chunks:
+                log_service_event("zip_no_valid_content", "ZIP contained no valid processable content", {
+                    "input": original_input,
+                    "zip_depth": _current_zip_depth
+                })
+                # Return empty list to trigger "Files Not found" response
+                return []
+            
             return chunks
 
+        # Step 5: Route to appropriate parser
         parser_func = Parser_Registry.get(ext)
         if not parser_func:
             log_service_event("unsupported_file_type", "Unsupported file type encountered", {
                 "extension": ext,
-                "path": temp_path
+                "path": temp_path,
+                "zip_depth": _current_zip_depth
             })
+            # Return empty list for unsupported file types
             return []
 
+        # Step 6: Execute parser and collect chunks
         chunks = parser_func(temp_path, source_url or original_input)
-        log_service_event("ingest_complete", "Completed ingestion", {
+        
+        # Check if parser returned any content
+        if not chunks:
+            log_service_event("parser_no_content", "Parser returned no content", {
+                "input": original_input,
+                "extension": ext,
+                "parser": parser_func.__name__,
+                "zip_depth": _current_zip_depth
+            })
+            # Return empty list to trigger "Files Not found" response
+            return []
+        
+        log_service_event("ingest_complete", "Completed ingestion successfully", {
             "input": original_input,
+            "extension": ext,
             "chunks": len(chunks),
+            "zip_depth": _current_zip_depth,
             "elapsed": time.time() - start
         })
         return chunks
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (security violations, etc.)
+        raise
+    except Exception as e:
+        # Log unexpected errors and convert to HTTP exception
+        log_error("ingest_unexpected_error", {
+            "input": original_input,
+            "zip_depth": _current_zip_depth,
+            "error": str(e),
+            "error_type": type(e).__name__
+        })
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error during file processing: {str(e)}"
+        )
     finally:
+        # Clean up temporary files (only for non-local, non-recursive calls)
         if temp_path and os.path.exists(temp_path) and not is_local and not _is_recursive:
             try:
                 os.unlink(temp_path)
-            except OSError:
-                pass
+                log_service_event("temp_file_cleanup", "Temporary file cleaned up", {
+                    "temp_path": temp_path
+                })
+            except OSError as e:
+                log_error("temp_file_cleanup_failed", {
+                    "temp_path": temp_path,
+                    "error": str(e)
+                })
 
 
 __all__ = ["ingest_from_url", "Parser_Registry", "parse_pdf_file"]
