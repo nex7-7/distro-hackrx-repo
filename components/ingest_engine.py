@@ -139,8 +139,8 @@ def parse_standard_document(file_path: str, source_url: str) -> List[str]:
 def parse_spreadsheet(file_path: str, source_url: str) -> List[str]:
     """Parse spreadsheet (.xlsx) into list[str] using pandas.
 
-    Each sheet will be processed separately, and columns/rows will be formatted
-    with appropriate headers.
+    Each sheet will be processed separately with preserved structure for better readability.
+    Tables are formatted to maintain alignment and preserve relationships between data cells.
     """
     try:
         import pandas as pd
@@ -166,25 +166,58 @@ def parse_spreadsheet(file_path: str, source_url: str) -> List[str]:
             if df.empty:
                 continue
 
-            # Format the sheet content
-            sheet_header = f"Sheet: {sheet_name}"
+            # Create a metadata header for the sheet
+            sheet_header = f"TABLE: {sheet_name}"
+            sheet_info = f"Rows: {df.shape[0]}, Columns: {df.shape[1]}"
+            metadata = f"{sheet_header}\n{sheet_info}\n{'=' * 50}"
 
-            # Convert DataFrame to a formatted string with headers and rows
-            table_str = df.to_string(index=False)
+            # Preserve structure by converting to markdown table format
+            # First, convert any numeric indices to strings
+            df.columns = df.columns.astype(str)
 
-            # Add to chunks with appropriate headers
-            chunks.append(f"{sheet_header}\n\n{table_str}")
+            # Format column headers with proper alignment
+            headers = " | ".join([str(col).strip() for col in df.columns])
+            separator = "-|-".join(["-" * len(str(col)) for col in df.columns])
 
-            # If the sheet is large, create additional chunks with specific column groups
-            # to improve search relevance
-            if df.shape[1] > 5:  # More than 5 columns
-                # Process column groups to create additional chunks for better searchability
-                for i in range(0, len(df.columns), 3):
-                    col_group = df.iloc[:, i:i+3]
-                    if not col_group.empty:
-                        group_str = col_group.to_string(index=False)
-                        chunks.append(
-                            f"{sheet_name} (columns {i+1}-{i+3}):\n\n{group_str}")
+            # Build the table rows with proper alignment
+            rows = []
+            for _, row in df.iterrows():
+                formatted_row = " | ".join(
+                    [str(val).strip() if pd.notna(val) else "" for val in row])
+                rows.append(formatted_row)
+
+            # Combine all parts into a well-structured table
+            table_content = f"{headers}\n{separator}\n" + "\n".join(rows)
+            structured_table = f"{metadata}\n\n{table_content}"
+
+            # Add the formatted table as a chunk
+            chunks.append(structured_table)
+
+            # For large tables, also create chunks by row groups to improve search relevance
+            if df.shape[0] > 10:  # More than 10 rows
+                # Adaptive chunk size
+                row_chunk_size = min(10, max(5, df.shape[0] // 5))
+
+                for i in range(0, df.shape[0], row_chunk_size):
+                    end_idx = min(i + row_chunk_size, df.shape[0])
+                    row_group = df.iloc[i:end_idx]
+
+                    # Create a sub-table with the same format
+                    sub_headers = " | ".join(
+                        [str(col).strip() for col in row_group.columns])
+                    sub_separator = "-|-".join(["-" * len(str(col))
+                                               for col in row_group.columns])
+
+                    sub_rows = []
+                    for _, row in row_group.iterrows():
+                        formatted_row = " | ".join(
+                            [str(val).strip() if pd.notna(val) else "" for val in row])
+                        sub_rows.append(formatted_row)
+
+                    sub_table = f"{sub_headers}\n{sub_separator}\n" + \
+                        "\n".join(sub_rows)
+                    sub_chunk = f"{sheet_header} - Rows {i+1}-{end_idx}\n{'=' * 30}\n\n{sub_table}"
+                    chunks.append(sub_chunk)
 
     except Exception as e:
         log_error("excel_pandas_parse_failed", {
@@ -294,34 +327,236 @@ def parse_pdf_file(file_path: str, source_url: str) -> List[str]:
         return []
 
 
-# --- PPTX Parser ---
+# --- PPTX Parser using Docling ---
 def parse_pptx_file(file_path: str, source_url: str) -> List[str]:
-    """Parse PPTX file and return list of text chunks (one per slide)."""
+    """Parse PPTX file and return list of text chunks using Docling.
+
+    Docling provides a comprehensive document parsing solution that extracts
+    text, images, and structures from PPTX files with better OCR capabilities.
+    """
+    try:
+        from docling.document_converter import DocumentConverter
+    except ImportError:
+        log_error("docling_import_failed", {
+            "file_path": file_path,
+            "error": "Required module not installed (docling). Try: pip install docling docling-core"
+        })
+        # Fall back to the old parser if available
+        try:
+            from pptx import Presentation
+            log_service_event("docling_fallback", "Falling back to python-pptx parser", {
+                "file_path": file_path
+            })
+            return _legacy_parse_pptx_file(file_path, source_url)
+        except ImportError:
+            return []
+
+    start_time = time.time()
+    chunks = []
+
+    try:
+        # Use Docling to convert the PPTX file
+        converter = DocumentConverter()
+        result = converter.convert(file_path)
+        document = result.document
+
+        # Get markdown representation
+        markdown_content = document.export_to_markdown()
+
+        # Process by slide (based on headings in markdown)
+        slide_chunks = []
+        current_slide = []
+        slide_count = 0
+
+        # Split the markdown content by lines for processing
+        lines = markdown_content.split('\n')
+        in_slide = False
+
+        for line in lines:
+            # Detect slide headers (typically headings in the markdown)
+            if line.startswith('# ') or line.startswith('## '):
+                # If we already collected content for a slide, save it
+                if current_slide:
+                    slide_count += 1
+                    slide_text = '\n\n'.join(current_slide)
+                    if not slide_text.startswith('Slide'):
+                        slide_text = f"Slide {slide_count}: {current_slide[0]}\n\n" + slide_text
+                    slide_chunks.append(slide_text)
+                    current_slide = []
+                in_slide = True
+
+            # If we're inside a slide, collect the content
+            if in_slide and line.strip():
+                current_slide.append(line)
+
+        # Don't forget the last slide
+        if current_slide:
+            slide_count += 1
+            slide_text = '\n\n'.join(current_slide)
+            if not slide_text.startswith('Slide'):
+                slide_text = f"Slide {slide_count}: {current_slide[0]}\n\n" + slide_text
+            slide_chunks.append(slide_text)
+
+        # Extract any tables and add them separately
+        tables = document.export_tables()
+        for i, table in enumerate(tables):
+            if table and isinstance(table, str) and len(table.strip()) > 50:
+                slide_chunks.append(f"Slide Table {i+1}:\n\n{table}")
+
+        # Extract any figures/images content
+        try:
+            figures = document.export_figures()
+            for i, figure in enumerate(figures):
+                if figure and hasattr(figure, 'alt_text') and figure.alt_text:
+                    slide_chunks.append(
+                        f"Slide Image {i+1}:\n\nImage Content: {figure.alt_text}")
+        except Exception as fig_err:
+            log_error("docling_figure_extraction_failed",
+                      {"error": str(fig_err)})
+
+        chunks = slide_chunks
+
+    except Exception as e:
+        log_error("docling_pptx_parse_failed", {
+            "file_path": file_path,
+            "error": str(e)
+        })
+        # Fall back to legacy parser
+        try:
+            log_service_event("docling_error_fallback", "Falling back to python-pptx parser after Docling error", {
+                "file_path": file_path,
+                "error": str(e)
+            })
+            return _legacy_parse_pptx_file(file_path, source_url)
+        except Exception:
+            return []
+
+    parsing_time = time.time() - start_time
+    log_service_event("pptx_parsed_with_docling", "Parsed PPTX file with Docling", {
+        "file_path": file_path,
+        "source_url": source_url,
+        "slides_processed": len(chunks),
+        "parsing_time_seconds": parsing_time
+    })
+    return chunks
+
+
+# Legacy PPTX parser as fallback
+def _legacy_parse_pptx_file(file_path: str, source_url: str) -> List[str]:
+    """Legacy PPTX parser using python-pptx as a fallback if Docling is unavailable."""
     try:
         from pptx import Presentation
+        import io
+        import os
+        from PIL import Image
     except ImportError:
         log_error("pptx_import_failed", {
-                  "file_path": file_path, "error": "python-pptx not installed"})
+                  "file_path": file_path, "error": "Required modules not installed (python-pptx, pillow)"})
         return []
+
     chunks = []
+    images_temp_dir = None
+
     try:
+        # Create temp directory for extracted images
+        images_temp_dir = tempfile.mkdtemp(prefix="pptx_images_")
         prs = Presentation(file_path)
-        for slide in prs.slides:
-            slide_text = []
+
+        for i, slide in enumerate(prs.slides):
+            slide_num = i + 1
+            slide_content = [f"Slide {slide_num}"]
+
+            # Get slide title if available
+            title = None
             for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    txt = shape.text.strip()
-                    if txt:
-                        slide_text.append(txt)
-            if slide_text:
-                chunks.append("\n".join(slide_text))
+                if shape.has_text_frame and shape.text.strip() and hasattr(shape, 'is_title') and shape.is_title:
+                    title = shape.text.strip()
+                    break
+
+            if title:
+                slide_content[0] = f"Slide {slide_num}: {title}"
+
+            # Extract text from all text shapes
+            text_content = []
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    text_content.append(shape.text.strip())
+
+            # Combine all text content
+            if text_content:
+                slide_content.append("Text Content:")
+                slide_content.append("\n".join(text_content))
+
+            # Extract and process images if available
+            image_content = []
+            img_count = 0
+
+            for shape in slide.shapes:
+                if shape.shape_type == 13:  # 13 is the enum value for pictures
+                    img_count += 1
+                    try:
+                        # Extract image to temp file
+                        image = shape.image
+                        image_bytes = image.blob
+                        img_ext = image.ext.lower() if hasattr(image, 'ext') else '.png'
+                        img_path = os.path.join(
+                            images_temp_dir, f"slide_{slide_num}_img_{img_count}{img_ext}")
+
+                        with open(img_path, 'wb') as img_file:
+                            img_file.write(image_bytes)
+
+                        # Use OCR on the image if unstructured is available
+                        if _UNSTRUCTURED_AVAILABLE:
+                            img_text = []
+                            try:
+                                elements = _unstructured_partition(
+                                    filename=img_path) or []
+                                for el in elements:
+                                    text = str(el).strip()
+                                    if text:
+                                        img_text.append(text)
+                            except Exception as ocr_err:
+                                log_error("image_ocr_failed", {
+                                    "file_path": img_path,
+                                    "slide": slide_num,
+                                    "error": str(ocr_err)
+                                })
+
+                            if img_text:
+                                image_content.append(
+                                    f"Image {img_count} content: {' '.join(img_text)}")
+                    except Exception as img_err:
+                        log_error("image_extraction_failed", {
+                            "slide": slide_num,
+                            "error": str(img_err)
+                        })
+
+            # Add image content if available
+            if image_content:
+                slide_content.append("\nImage Content:")
+                slide_content.extend(image_content)
+
+            # Add this slide's content as a chunk
+            if len(slide_content) > 1:  # More than just the slide header
+                chunks.append("\n\n".join(slide_content))
+
     except Exception as e:
         log_error("pptx_parse_failed", {
                   "file_path": file_path, "error": str(e)})
         return []
-    log_service_event("pptx_parsed", "Parsed PPTX file", {
+    finally:
+        # Clean up temp directory
+        if images_temp_dir and os.path.exists(images_temp_dir):
+            try:
+                import shutil
+                shutil.rmtree(images_temp_dir)
+            except Exception:
+                pass
+
+    log_service_event("pptx_parsed_legacy", "Parsed PPTX file with legacy parser", {
         "file_path": file_path,
         "source_url": source_url,
+        "slides_processed": len(prs.slides) if 'prs' in locals() else 0,
         "chunks": len(chunks)
     })
     return chunks

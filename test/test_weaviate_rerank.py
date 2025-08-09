@@ -155,10 +155,45 @@ class WeaviateRerankerTester:
         )
         print("✅ Data ingested successfully")
         
-        # Show sample chunks
+        # Show sample chunks with more detailed analysis
         print(f"\n📋 Sample chunks preview:")
         for i, chunk in enumerate(self.chunks[:3]):
-            print(f"  Chunk {i+1}: {chunk[:150]}...")
+            print(f"  Chunk {i+1} ({len(chunk)} chars):")
+            
+            # Check for table structure (from Excel files)
+            if "TABLE:" in chunk[:20]:
+                print("  📊 Structured Table Data Detected")
+                # Show table header and first few rows
+                lines = chunk.split("\n")
+                header_lines = [line for line in lines[:6] if line.strip()]
+                print(f"  Table Info: {' | '.join(header_lines[:2])}")
+                print("  Table Preview:")
+                for line in lines[6:12]:  # Show a few rows
+                    if line.strip():
+                        print(f"    {line[:80]}" + ("..." if len(line) > 80 else ""))
+                print(f"    ... (and {len(lines) - 12} more lines)")
+                
+            # Check for slide structure (from PowerPoint files)
+            elif chunk.startswith("Slide "):
+                print("  🖼️ PowerPoint Slide Content Detected")
+                sections = chunk.split("\n\n")
+                print(f"  {sections[0]}")  # Slide title
+                
+                # Show text and image content sections
+                text_section = next((s for s in sections if s.startswith("Text Content:")), None)
+                image_section = next((s for s in sections if s.startswith("Image Content:")), None)
+                
+                if text_section:
+                    text_preview = text_section.split("\n", 1)[1] if "\n" in text_section else text_section
+                    print(f"  Text Content Preview: {text_preview[:100]}...")
+                    
+                if image_section:
+                    print(f"  🖼️ Contains extracted image text ({len(image_section)} chars)")
+            
+            # Standard text content
+            else:
+                print(f"  {chunk[:200]}...")
+                print(f"  ... (total {len(chunk)} characters)")
 
     def rerank_chunks(self, query: str, chunks: List[str]) -> Tuple[List[str], List[float]]:
         """Rerank chunks using the reranker model."""
@@ -220,11 +255,20 @@ class WeaviateRerankerTester:
             print("❌ No chunks retrieved from search")
             return
 
-        # Display original top results
+        # Display original top results with better formatting for structured content
         print("\n📊 Original Top 5 Results from Hybrid Search:")
         for i, (chunk, score) in enumerate(zip(context_chunks[:5], chunk_scores[:5])):
             score_str = f"{score:.4f}" if score is not None else "N/A"
-            print(f"  {i+1}. Score: {score_str} | {chunk[:100]}...")
+            
+            # Check for different content types and display appropriately
+            if chunk.startswith("TABLE:"):
+                table_name = chunk.split('\n')[0].replace("TABLE:", "").strip()
+                print(f"  {i+1}. Score: {score_str} | 📊 Excel Table: {table_name} ({len(chunk)} chars)")
+            elif chunk.startswith("Slide "):
+                slide_title = chunk.split('\n')[0]
+                print(f"  {i+1}. Score: {score_str} | 🖼️ {slide_title} ({len(chunk)} chars)")
+            else:
+                print(f"  {i+1}. Score: {score_str} | {chunk[:100]}...")
 
         # Rerank all retrieved chunks
         reranked_chunks, reranked_scores = self.rerank_chunks(
@@ -234,11 +278,20 @@ class WeaviateRerankerTester:
         final_chunks = reranked_chunks[:top_k]
         final_scores = reranked_scores[:top_k]
 
-        # Display reranked top results
+        # Display reranked top results with better formatting for structured content
         print(f"\n🏆 Top 5 Results After Reranking:")
         for i, (chunk, score) in enumerate(zip(final_chunks[:5], final_scores[:5])):
             score_str = f"{score:.4f}" if score is not None else "N/A"
-            print(f"  {i+1}. Score: {score_str} | {chunk[:100]}...")
+            
+            # Check for different content types and display appropriately
+            if chunk.startswith("TABLE:"):
+                table_name = chunk.split('\n')[0].replace("TABLE:", "").strip()
+                print(f"  {i+1}. Score: {score_str} | 📊 Excel Table: {table_name} ({len(chunk)} chars)")
+            elif chunk.startswith("Slide "):
+                slide_title = chunk.split('\n')[0]
+                print(f"  {i+1}. Score: {score_str} | 🖼️ {slide_title} ({len(chunk)} chars)")
+            else:
+                print(f"  {i+1}. Score: {score_str} | {chunk[:100]}...")
 
         # Show improvement metrics
         print(f"\n📈 Metrics:")
