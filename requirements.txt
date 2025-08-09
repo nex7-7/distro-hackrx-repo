@@ -1,6 +1,6 @@
 # FastAPI and web framework
 fastapi
-uvicorn
+uvicorn[standard]
 
 # Pydantic for data validation
 pydantic

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 import time
+from datetime import datetime
 
 import requests
 import pymupdf4llm
@@ -26,6 +27,7 @@ from PIL import Image
 import email
 from email.policy import default
 
+from config.settings import settings
 from app.models.schemas import DocumentInfo
 from app.utils.logger import get_logger
 from app.utils.exceptions import (
@@ -61,8 +63,26 @@ class DocumentProcessor:
     
     def __init__(self) -> None:
         """Initialize the document processor."""
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="rag_docs_"))
-        logger.info("Document processor initialized", temp_dir=str(self.temp_dir))
+        # Create timestamped download directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        project_root = Path(__file__).parent.parent.parent  # Navigate to project root
+        self.downloads_dir = project_root / "downloads" / f"data_{timestamp}"
+        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Configure Tesseract path if specified
+        if settings.tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
+            logger.info("Tesseract configured", cmd_path=settings.tesseract_cmd)
+        else:
+            # Try to detect Tesseract automatically
+            try:
+                # Test if tesseract is available in PATH
+                version = pytesseract.get_tesseract_version()
+                logger.info("Tesseract found in PATH", version=str(version))
+            except pytesseract.TesseractNotFoundError:
+                logger.warning("Tesseract not found in PATH. Image processing will fail unless TESSERACT_CMD is set.")
+        
+        logger.info("Document processor initialized", downloads_dir=str(self.downloads_dir))
     
     async def process_document(self, document_url: str) -> DocumentInfo:
         """
@@ -126,9 +146,7 @@ class DocumentProcessor:
         except Exception as e:
             logger.error(f"Document processing failed: {str(e)}", url=document_url)
             raise
-        finally:
-            # Cleanup temporary files
-            self._cleanup_temp_files(file_path if 'file_path' in locals() else None)
+        # Note: Files are now stored permanently in downloads directory for data management
     
     async def _download_document(self, url: str) -> Tuple[Path, str]:
         """
@@ -154,8 +172,8 @@ class DocumentProcessor:
             response = requests.get(url, stream=True, timeout=30)
             response.raise_for_status()
             
-            # Save to temporary file
-            file_path = self.temp_dir / filename
+            # Save to downloads directory
+            file_path = self.downloads_dir / filename
             with open(file_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
@@ -430,12 +448,25 @@ class DocumentProcessor:
     def _extract_image_text(self, file_path: Path) -> Tuple[str, str, None]:
         """Extract text from image using OCR."""
         try:
+            # Check if Tesseract is available before attempting OCR
+            try:
+                pytesseract.get_tesseract_version()
+            except pytesseract.TesseractNotFoundError:
+                raise create_error(
+                    DocumentExtractionError,
+                    "Tesseract OCR not found. Please install Tesseract or set TESSERACT_CMD environment variable.",
+                    "TESSERACT_NOT_FOUND"
+                )
+            
             image = Image.open(file_path)
             text = pytesseract.image_to_string(image)
             
             logger.debug("Image OCR completed", text_length=len(text))
             return text, "pytesseract_ocr", None
             
+        except DocumentExtractionError:
+            # Re-raise our custom errors
+            raise
         except Exception as e:
             raise create_error(
                 DocumentExtractionError,
@@ -452,8 +483,8 @@ class DocumentProcessor:
             with zipfile.ZipFile(file_path, 'r') as zip_file:
                 for file_info in zip_file.infolist():
                     if not file_info.is_dir():
-                        # Extract file to temporary location
-                        extracted_path = self.temp_dir / file_info.filename
+                        # Extract file to downloads directory
+                        extracted_path = self.downloads_dir / file_info.filename
                         extracted_path.parent.mkdir(parents=True, exist_ok=True)
                         
                         with zip_file.open(file_info) as source, open(extracted_path, 'wb') as target:
@@ -518,12 +549,10 @@ class DocumentProcessor:
         return text[:max_chars] if len(text) > max_chars else text
     
     def _cleanup_temp_files(self, file_path: Optional[Path]) -> None:
-        """Clean up temporary files."""
-        try:
-            if file_path and file_path.exists():
-                file_path.unlink()
-                logger.debug("Temporary file cleaned up", file=str(file_path))
-        except Exception as e:
-            logger.warning("Failed to cleanup temporary file", 
-                          file=str(file_path), 
-                          error=str(e))
+        """
+        Note: Files are no longer cleaned up as they are stored permanently 
+        in the downloads directory for data management purposes.
+        """
+        # Files are now stored permanently in downloads/{timestamp} directories
+        # This method is kept for backward compatibility but does nothing
+        pass

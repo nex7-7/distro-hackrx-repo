@@ -14,13 +14,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 import weaviate
-from weaviate import Client
-from weaviate.exceptions import (
-    WeaviateBaseError,
-    WeaviateConnectionError,
-    WeaviateQueryError,
-    WeaviateTimeoutError
-)
+import weaviate.classes as wvc
+from weaviate.classes.config import Property, DataType
+from weaviate.exceptions import WeaviateBaseError
 
 from config.settings import settings
 from app.models.schemas import ChunkData, DocumentInfo
@@ -37,19 +33,18 @@ class VectorStore:
     
     This class provides high-performance vector operations with multiprocessing
     support for concurrent chunk storage and parallel query execution.
+    Each document gets its own collection for better isolation and performance.
     """
     
     def __init__(self) -> None:
         """Initialize the vector store service."""
-        self.client: Optional[Client] = None
-        self.class_name = settings.weaviate_class_name
+        self.client: Optional[weaviate.WeaviateClient] = None
         self.weaviate_url = settings.weaviate_url
         self.executor = ThreadPoolExecutor(max_workers=settings.max_workers)
         self._client_lock = threading.Lock()
         
         logger.info("Vector store initialized", 
-                   url=self.weaviate_url,
-                   class_name=self.class_name)
+                   url=self.weaviate_url)
     
     async def connect(self) -> None:
         """
@@ -64,22 +59,26 @@ class VectorStore:
                     try:
                         logger.info("Connecting to Weaviate", url=self.weaviate_url)
                         
-                        # Create Weaviate client
-                        self.client = weaviate.Client(
-                            url=self.weaviate_url,
-                            timeout_config=(5, 15)  # (connection, read) timeouts
+                        # Create Weaviate client (v4 API)
+                        # Parse URL to extract host
+                        from urllib.parse import urlparse
+                        parsed_url = urlparse(self.weaviate_url)
+                        host = parsed_url.hostname or 'localhost'
+                        port = parsed_url.port or 8080
+                        
+                        self.client = weaviate.connect_to_local(
+                            host=host,
+                            port=port,
+                            grpc_port=50051
                         )
                         
-                        # Test connection
+                        # Ensure connection works
                         if not self.client.is_ready():
                             raise create_error(
                                 VectorStoreError,
                                 "Weaviate is not ready",
                                 "WEAVIATE_NOT_READY"
                             )
-                        
-                        # Ensure schema exists
-                        await self._ensure_schema()
                         
                         logger.info("Successfully connected to Weaviate")
                         
@@ -97,112 +96,98 @@ class VectorStore:
                             "WEAVIATE_UNEXPECTED_ERROR"
                         )
     
-    async def _ensure_schema(self) -> None:
-        """Ensure the required schema exists in Weaviate."""
-        try:
-            # Check if class exists
-            schema = self.client.schema.get()
-            existing_classes = [cls['class'] for cls in schema.get('classes', [])]
-            
-            if self.class_name not in existing_classes:
-                logger.info("Creating Weaviate schema", class_name=self.class_name)
-                
-                # Define schema for document chunks
-                class_definition = {
-                    "class": self.class_name,
-                    "description": "Document chunks for RAG retrieval",
-                    "vectorizer": "none",  # We provide our own vectors
-                    "properties": [
-                        {
-                            "name": "content",
-                            "dataType": ["text"],
-                            "description": "Text content of the chunk"
-                        },
-                        {
-                            "name": "chunk_id",
-                            "dataType": ["string"],
-                            "description": "Unique identifier for the chunk"
-                        },
-                        {
-                            "name": "chunk_index",
-                            "dataType": ["int"],
-                            "description": "Index of chunk within document"
-                        },
-                        {
-                            "name": "document_hash",
-                            "dataType": ["string"],
-                            "description": "Hash of the source document"
-                        },
-                        {
-                            "name": "document_url",
-                            "dataType": ["string"],
-                            "description": "URL of the source document"
-                        },
-                        {
-                            "name": "document_filename",
-                            "dataType": ["string"],
-                            "description": "Filename of the source document"
-                        },
-                        {
-                            "name": "source_page",
-                            "dataType": ["int"],
-                            "description": "Source page number (if applicable)"
-                        },
-                        {
-                            "name": "metadata",
-                            "dataType": ["object"],
-                            "description": "Additional metadata"
-                        }
-                    ]
-                }
-                
-                self.client.schema.create_class(class_definition)
-                logger.info("Schema created successfully")
-            else:
-                logger.debug("Schema already exists")
-                
-        except Exception as e:
-            raise create_error(
-                VectorStoreError,
-                f"Failed to ensure schema: {str(e)}",
-                "SCHEMA_SETUP_FAILED"
-            )
-    
-    async def document_exists(self, document_hash: str) -> bool:
+    def _get_collection_name(self, document_hash: str) -> str:
         """
-        Check if document already exists in vector store.
+        Generate collection name for a document.
         
         Args:
             document_hash: SHA-256 hash of document content
             
         Returns:
-            bool: True if document exists
+            str: Collection name for the document
+        """
+        # Use first 16 characters of hash to keep collection names reasonable
+        # Prefix with 'Doc_' to ensure valid collection name
+        return f"Doc_{document_hash[:16]}"
+    
+    async def _ensure_document_collection(self, document_hash: str, document_info: DocumentInfo) -> str:
+        """
+        Ensure a collection exists for the document.
+        
+        Args:
+            document_hash: SHA-256 hash of document content
+            document_info: Document metadata
+            
+        Returns:
+            str: Collection name for the document
             
         Raises:
-            VectorStoreError: If query fails
+            VectorStoreError: If collection creation fails
+        """
+        collection_name = self._get_collection_name(document_hash)
+        
+        try:
+            # Check if collection exists
+            if not self.client.collections.exists(collection_name):
+                logger.info("Creating document collection", 
+                          collection_name=collection_name,
+                          document=document_info.filename)
+                
+                # Define properties for document chunks
+                properties = [
+                    Property(name="content", data_type=DataType.TEXT),
+                    Property(name="chunk_id", data_type=DataType.TEXT),
+                    Property(name="chunk_index", data_type=DataType.INT),
+                    Property(name="source_page", data_type=DataType.INT),
+                    Property(name="metadata", data_type=DataType.TEXT),
+                ]
+                
+                # Create collection with document metadata
+                collection_description = f"Chunks for document: {document_info.filename}"
+                
+                self.client.collections.create(
+                    name=collection_name,
+                    description=collection_description,
+                    properties=properties,
+                    vector_config=wvc.config.Configure.Vectors.self_provided()
+                )
+                
+                logger.info("Document collection created", collection_name=collection_name)
+            else:
+                logger.debug("Document collection already exists", collection_name=collection_name)
+            
+            return collection_name
+            
+        except Exception as e:
+            raise create_error(
+                VectorStoreError,
+                f"Failed to ensure document collection: {str(e)}",
+                "COLLECTION_CREATION_FAILED",
+                collection_name=collection_name
+            )
+    
+    async def document_exists(self, document_hash: str) -> bool:
+        """
+        Check if document already exists in vector store by checking collection existence.
+        
+        Args:
+            document_hash: SHA-256 hash of document content
+            
+        Returns:
+            bool: True if document exists (collection exists)
+            
+        Raises:
+            VectorStoreError: If check fails
         """
         try:
             await self.connect()
             
-            logger.debug("Checking document existence", hash=document_hash)
-            
-            result = (
-                self.client.query
-                .get(self.class_name, ["chunk_id"])
-                .with_where({
-                    "path": ["document_hash"],
-                    "operator": "Equal",
-                    "valueString": document_hash
-                })
-                .with_limit(1)
-                .do()
-            )
-            
-            chunks = result.get("data", {}).get("Get", {}).get(self.class_name, [])
-            exists = len(chunks) > 0
+            collection_name = self._get_collection_name(document_hash)
+            exists = self.client.collections.exists(collection_name)
             
             logger.debug("Document existence check completed", 
                         hash=document_hash,
+                        collection_name=collection_name,
                         exists=exists)
             
             return exists
@@ -221,7 +206,7 @@ class VectorStore:
         document_info: DocumentInfo
     ) -> None:
         """
-        Store document chunks in vector store with multiprocessing.
+        Store document chunks in document-specific vector store collection.
         
         Args:
             chunks: List of document chunks with embeddings
@@ -233,9 +218,16 @@ class VectorStore:
         start_time = time.time()
         await self.connect()
         
+        # Ensure document collection exists
+        collection_name = await self._ensure_document_collection(
+            document_info.content_hash, 
+            document_info
+        )
+        
         logger.log_stage("Vector Storage", "Starting", 
                         chunk_count=len(chunks),
-                        document=document_info.filename)
+                        document=document_info.filename,
+                        collection=collection_name)
         
         try:
             # Use multiprocessing for concurrent storage
@@ -249,7 +241,7 @@ class VectorStore:
                     self.executor,
                     self._store_chunk_batch,
                     batch,
-                    document_info
+                    collection_name
                 )
                 futures.append(future)
             
@@ -271,12 +263,14 @@ class VectorStore:
                 "Vector Storage",
                 duration,
                 chunk_count=len(chunks),
-                chunks_per_second=len(chunks) / duration
+                chunks_per_second=len(chunks) / duration,
+                collection=collection_name
             )
             
         except Exception as e:
             logger.error(f"Chunk storage failed: {str(e)}", 
-                        chunk_count=len(chunks))
+                        chunk_count=len(chunks),
+                        collection=collection_name)
             
             if isinstance(e, VectorStoreError):
                 raise
@@ -285,63 +279,71 @@ class VectorStore:
                 VectorStoreError,
                 f"Failed to store chunks: {str(e)}",
                 "STORAGE_FAILED",
-                chunk_count=len(chunks)
+                chunk_count=len(chunks),
+                collection=collection_name
             )
     
     def _store_chunk_batch(
         self, 
         chunk_batch: List[ChunkData], 
-        document_info: DocumentInfo
+        collection_name: str
     ) -> None:
         """
         Store a batch of chunks synchronously (runs in thread pool).
         
         Args:
             chunk_batch: Batch of chunks to store
-            document_info: Document metadata
+            collection_name: Name of the document collection
         """
         try:
-            # Use batch import for efficiency
-            with self.client.batch as batch:
-                batch.batch_size = len(chunk_batch)
+            import json
+            collection = self.client.collections.get(collection_name)
+            
+            # Prepare data objects for batch insertion
+            objects = []
+            for chunk in chunk_batch:
+                # Prepare properties (no need for document-level metadata)
+                properties = {
+                    "content": chunk.content,
+                    "chunk_id": chunk.chunk_id,
+                    "chunk_index": chunk.chunk_index,
+                    "source_page": chunk.source_page,
+                    "metadata": json.dumps(chunk.metadata) if chunk.metadata else "{}"
+                }
                 
-                for chunk in chunk_batch:
-                    # Prepare properties
-                    properties = {
-                        "content": chunk.content,
-                        "chunk_id": chunk.chunk_id,
-                        "chunk_index": chunk.chunk_index,
-                        "document_hash": document_info.content_hash,
-                        "document_url": str(document_info.url),
-                        "document_filename": document_info.filename,
-                        "source_page": chunk.source_page,
-                        "metadata": chunk.metadata
-                    }
-                    
-                    # Add to batch with vector
-                    batch.add_data_object(
-                        data_object=properties,
-                        class_name=self.class_name,
+                # Create data object with vector
+                objects.append(
+                    wvc.data.DataObject(
+                        properties=properties,
                         vector=chunk.embedding
                     )
+                )
             
-            logger.debug("Stored chunk batch", batch_size=len(chunk_batch))
+            # Insert batch
+            collection.data.insert_many(objects)
+            
+            logger.debug("Stored chunk batch", 
+                        batch_size=len(chunk_batch),
+                        collection=collection_name)
             
         except Exception as e:
             logger.error(f"Failed to store chunk batch: {str(e)}", 
-                        batch_size=len(chunk_batch))
+                        batch_size=len(chunk_batch),
+                        collection=collection_name)
             raise
     
     async def search_similar_chunks(
         self, 
         query_embedding: List[float], 
+        document_hash: str,
         limit: int = None
     ) -> List[Tuple[ChunkData, float]]:
         """
-        Search for similar chunks using vector similarity.
+        Search for similar chunks within a specific document's collection.
         
         Args:
             query_embedding: Query vector embedding
+            document_hash: Hash of the document to search within
             limit: Maximum number of results (defaults to settings.retrieval_top_k)
             
         Returns:
@@ -354,48 +356,59 @@ class VectorStore:
             limit = settings.retrieval_top_k
         
         try:
+            import json
             await self.connect()
             
-            logger.debug("Searching similar chunks", limit=limit)
+            collection_name = self._get_collection_name(document_hash)
+            
+            # Check if document collection exists
+            if not self.client.collections.exists(collection_name):
+                logger.warning("Document collection not found", 
+                             document_hash=document_hash,
+                             collection_name=collection_name)
+                return []
+            
+            logger.debug("Searching similar chunks", 
+                        limit=limit,
+                        collection=collection_name)
+            
+            collection = self.client.collections.get(collection_name)
             
             # Perform vector search
-            result = (
-                self.client.query
-                .get(self.class_name, [
-                    "content", "chunk_id", "chunk_index", "document_hash",
-                    "document_url", "document_filename", "source_page", "metadata"
-                ])
-                .with_near_vector({
-                    "vector": query_embedding
-                })
-                .with_limit(limit)
-                .with_additional(["distance"])
-                .do()
+            result = collection.query.near_vector(
+                near_vector=query_embedding,
+                limit=limit,
+                return_metadata=wvc.query.MetadataQuery(distance=True)
             )
             
-            # Parse results
-            chunks_data = result.get("data", {}).get("Get", {}).get(self.class_name, [])
-            
             results = []
-            for item in chunks_data:
+            for obj in result.objects:
+                # Parse metadata from JSON string
+                metadata_str = obj.properties.get("metadata", "{}")
+                try:
+                    metadata = json.loads(metadata_str) if metadata_str else {}
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+                
                 # Extract chunk data
                 chunk = ChunkData(
-                    chunk_id=item["chunk_id"],
-                    content=item["content"],
-                    chunk_index=item["chunk_index"],
-                    source_page=item.get("source_page"),
-                    metadata=item.get("metadata", {})
+                    chunk_id=obj.properties["chunk_id"],
+                    content=obj.properties["content"],
+                    chunk_index=obj.properties["chunk_index"],
+                    source_page=obj.properties.get("source_page"),
+                    metadata=metadata
                 )
                 
                 # Extract similarity score (distance -> similarity)
-                distance = item.get("_additional", {}).get("distance", 1.0)
+                distance = obj.metadata.distance if obj.metadata else 1.0
                 similarity = 1.0 - distance  # Convert distance to similarity
                 
                 results.append((chunk, similarity))
             
             logger.debug("Vector search completed", 
                         results_found=len(results),
-                        limit=limit)
+                        limit=limit,
+                        collection=collection_name)
             
             return results
             
@@ -404,19 +417,22 @@ class VectorStore:
                 VectorStoreError,
                 f"Vector search failed: {str(e)}",
                 "SEARCH_FAILED",
-                limit=limit
+                limit=limit,
+                document_hash=document_hash
             )
     
     async def search_by_keywords(
         self, 
         keywords: List[str], 
+        document_hash: str,
         limit: int = None
     ) -> List[Tuple[ChunkData, float]]:
         """
-        Search chunks by keywords using hybrid search.
+        Search chunks by keywords within a specific document's collection.
         
         Args:
             keywords: List of keywords to search for
+            document_hash: Hash of the document to search within
             limit: Maximum number of results
             
         Returns:
@@ -430,21 +446,23 @@ class VectorStore:
             
             logger.debug("Searching by keywords", 
                         keywords=keywords,
-                        limit=limit)
+                        limit=limit,
+                        document_hash=document_hash)
             
             # Generate embedding for keyword query
             keyword_query = " ".join(keywords)
             query_embedding = await embedding_service.generate_query_embedding(keyword_query)
             
-            # Use vector search (which is more effective than keyword search)
-            return await self.search_similar_chunks(query_embedding, limit)
+            # Use vector search within the specific document
+            return await self.search_similar_chunks(query_embedding, document_hash, limit)
             
         except Exception as e:
             raise create_error(
                 VectorStoreError,
                 f"Keyword search failed: {str(e)}",
                 "KEYWORD_SEARCH_FAILED",
-                keywords=keywords
+                keywords=keywords,
+                document_hash=document_hash
             )
     
     async def get_document_chunks(self, document_hash: str) -> List[ChunkData]:
@@ -458,39 +476,48 @@ class VectorStore:
             List[ChunkData]: All chunks for the document
         """
         try:
+            import json
             await self.connect()
             
-            result = (
-                self.client.query
-                .get(self.class_name, [
-                    "content", "chunk_id", "chunk_index", 
-                    "source_page", "metadata"
-                ])
-                .with_where({
-                    "path": ["document_hash"],
-                    "operator": "Equal", 
-                    "valueString": document_hash
-                })
-                .with_sort([{"path": ["chunk_index"], "order": "asc"}])
-                .do()
-            )
+            collection_name = self._get_collection_name(document_hash)
             
-            chunks_data = result.get("data", {}).get("Get", {}).get(self.class_name, [])
+            # Check if document collection exists
+            if not self.client.collections.exists(collection_name):
+                logger.warning("Document collection not found", 
+                             document_hash=document_hash,
+                             collection_name=collection_name)
+                return []
+            
+            collection = self.client.collections.get(collection_name)
+            
+            # Use iterator to get all chunks for the document
+            objects_iterator = collection.iterator()
             
             chunks = []
-            for item in chunks_data:
+            for obj in objects_iterator:
+                # Parse metadata from JSON string
+                metadata_str = obj.properties.get("metadata", "{}")
+                try:
+                    metadata = json.loads(metadata_str) if metadata_str else {}
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+                
                 chunk = ChunkData(
-                    chunk_id=item["chunk_id"],
-                    content=item["content"],
-                    chunk_index=item["chunk_index"],
-                    source_page=item.get("source_page"),
-                    metadata=item.get("metadata", {})
+                    chunk_id=obj.properties["chunk_id"],
+                    content=obj.properties["content"],
+                    chunk_index=obj.properties["chunk_index"],
+                    source_page=obj.properties.get("source_page"),
+                    metadata=metadata
                 )
                 chunks.append(chunk)
             
+            # Sort by chunk index
+            chunks.sort(key=lambda x: x.chunk_index)
+            
             logger.debug("Retrieved document chunks",
                         document_hash=document_hash,
-                        chunk_count=len(chunks))
+                        chunk_count=len(chunks),
+                        collection=collection_name)
             
             return chunks
             
@@ -502,38 +529,48 @@ class VectorStore:
                 document_hash=document_hash
             )
     
-    async def delete_document(self, document_hash: str) -> int:
+    async def delete_document(self, document_hash: str) -> bool:
         """
-        Delete all chunks for a document.
+        Delete all chunks for a specific document by deleting its collection.
         
         Args:
             document_hash: Document content hash
             
         Returns:
-            int: Number of chunks deleted
+            bool: True if deletion was successful
         """
         try:
             await self.connect()
             
-            logger.info("Deleting document chunks", document_hash=document_hash)
+            collection_name = self._get_collection_name(document_hash)
             
-            # Delete by document hash
-            result = self.client.batch.delete_objects(
-                class_name=self.class_name,
-                where={
-                    "path": ["document_hash"],
-                    "operator": "Equal",
-                    "valueString": document_hash
-                }
-            )
-            
-            deleted_count = result.get("results", {}).get("successful", 0)
-            
-            logger.info("Document chunks deleted",
+            logger.info("Deleting document collection", 
                        document_hash=document_hash,
-                       deleted_count=deleted_count)
+                       collection_name=collection_name)
             
-            return deleted_count
+            # Check if document collection exists
+            if not self.client.collections.exists(collection_name):
+                logger.warning("Document collection not found for deletion",
+                             document_hash=document_hash,
+                             collection_name=collection_name)
+                return True  # Already deleted
+            
+            # Delete the entire collection for this document
+            self.client.collections.delete(collection_name)
+            
+            logger.info("Document collection deleted successfully",
+                       document_hash=document_hash,
+                       collection_name=collection_name)
+            
+            return True
+            
+        except Exception as e:
+            raise create_error(
+                VectorStoreError,
+                f"Failed to delete document: {str(e)}",
+                "DOCUMENT_DELETION_FAILED",
+                document_hash=document_hash
+            )
             
         except Exception as e:
             raise create_error(
@@ -554,20 +591,23 @@ class VectorStore:
             if self.client is None:
                 return {"status": "disconnected"}
             
-            # Get object count
-            result = (
-                self.client.query
-                .aggregate(self.class_name)
-                .with_meta_count()
-                .do()
-            )
+            # Get all collections and count total objects
+            all_collections = list(self.client.collections.list_all())
+            total_count = 0
             
-            count = result.get("data", {}).get("Aggregate", {}).get(self.class_name, [{}])[0].get("meta", {}).get("count", 0)
+            for collection_name in all_collections:
+                try:
+                    collection = self.client.collections.get(collection_name)
+                    result = collection.aggregate.over_all(total_count=True)
+                    total_count += result.total_count or 0
+                except Exception:
+                    # Skip collections that can't be accessed
+                    continue
             
             return {
                 "status": "connected",
-                "total_chunks": count,
-                "class_name": self.class_name,
+                "total_chunks": total_count,
+                "total_collections": len(all_collections),
                 "weaviate_url": self.weaviate_url
             }
             
@@ -577,6 +617,11 @@ class VectorStore:
     
     def __del__(self) -> None:
         """Cleanup resources when service is destroyed."""
+        if hasattr(self, 'client') and self.client is not None:
+            try:
+                self.client.close()
+            except:
+                pass
         if hasattr(self, 'executor'):
             self.executor.shutdown(wait=False)
 

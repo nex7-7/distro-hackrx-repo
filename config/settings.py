@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     # Embedding Configuration
     embedding_model: str = Field(default="BAAI/bge-m3", env="EMBEDDING_MODEL")
     
+    # OCR Configuration (Tesseract)
+    tesseract_cmd: Optional[str] = Field(default=None, env="TESSERACT_CMD")
+    
     # Chunking Configuration
     min_chunk_size: int = Field(default=100, env="MIN_CHUNK_SIZE")
     max_chunk_size: int = Field(default=1000, env="MAX_CHUNK_SIZE")

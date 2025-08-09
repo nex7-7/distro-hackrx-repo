@@ -7,6 +7,7 @@ A high-performance, containerized RAG (Retrieval-Augmented Generation) Applicati
 ### Prerequisites
 - Docker and Docker Compose installed
 - Google Gemini API key
+- Tesseract OCR (for image processing)
 
 ### Setup & Run
 
@@ -101,6 +102,50 @@ Authorization: Bearer fd8defb3118175da9553e106c05f40bc476971f0b46a400db1e625eaff
    python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
    ```
 
+### Installing Tesseract OCR
+
+The application requires Tesseract OCR for processing image files (PNG, JPG, JPEG).
+
+#### Windows:
+1. **Download installer**: [UB-Mannheim/tesseract](https://github.com/UB-Mannheim/tesseract/wiki)
+2. **Install to default location**: `C:\Program Files\Tesseract-OCR\tesseract.exe`
+3. **Add to PATH** or set environment variable:
+   ```env
+   TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
+   ```
+
+#### macOS:
+```bash
+# Using Homebrew
+brew install tesseract
+
+# Using MacPorts
+sudo port install tesseract3
+```
+
+#### Linux (Ubuntu/Debian):
+```bash
+sudo apt update
+sudo apt install tesseract-ocr
+```
+
+#### Linux (CentOS/RHEL):
+```bash
+sudo yum install tesseract
+# or
+sudo dnf install tesseract
+```
+
+#### Docker (Automatic):
+If running with Docker, Tesseract is automatically included in the container.
+
+#### Verification:
+```bash
+tesseract --version
+```
+
+If Tesseract is not in your PATH, set the `TESSERACT_CMD` environment variable to point to the executable.
+
 ### Configuration
 
 Key environment variables in `.env`:
@@ -111,6 +156,7 @@ Key environment variables in `.env`:
 | `API_BEARER_TOKEN` | API authentication token | Required |
 | `WEAVIATE_URL` | Weaviate database URL | `http://localhost:8080` |
 | `LLM_MODEL` | Google model to use | `gemini-1.5-flash` |
+| `TESSERACT_CMD` | Path to Tesseract executable | Auto-detected |
 | `LOG_LEVEL` | Logging level | `INFO` |
 
 ## 🔧 Architecture
@@ -181,6 +227,19 @@ The application includes built-in performance logging for each pipeline stage.
    - Check file accessibility and format support
    - Review logs for specific error details
    - Ensure sufficient disk space for temporary files
+
+5. **Image processing errors (Tesseract):**
+   ```bash
+   # Test Tesseract installation
+   tesseract --version
+   
+   # If not found, install or set TESSERACT_CMD
+   # Windows example:
+   TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
+   
+   # Check application logs for OCR errors
+   docker-compose logs rag-api | grep OCR
+   ```
 
 ### Reset Everything
 ```bash

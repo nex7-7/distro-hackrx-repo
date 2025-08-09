@@ -84,7 +84,7 @@ class RAGPipeline:
         
         try:
             # Stage 1: Document Ingestion & Preprocessing
-            document_info = await self._stage_1_document_processing(request.documents)
+            document_info = await self._stage_1_document_processing(str(request.documents))
             
             # Stage 2: Data Chunking & Vectorization
             was_processed = await self._stage_2_chunking_vectorization(document_info)
@@ -95,7 +95,9 @@ class RAGPipeline:
             )
             
             # Stage 4: Context Retrieval
-            retrieval_results = await self._stage_4_context_retrieval(query_analyses)
+            retrieval_results = await self._stage_4_context_retrieval(
+                query_analyses, document_info.content_hash
+            )
             
             # Stage 5: Response Generation
             generated_responses = await self._stage_5_response_generation(
@@ -215,15 +217,16 @@ class RAGPipeline:
     
     async def _stage_4_context_retrieval(
         self, 
-        query_analyses: List[QueryAnalysis]
+        query_analyses: List[QueryAnalysis],
+        document_hash: str
     ) -> Dict[str, str]:
         """
         Stage 4: Context Retrieval.
         
         Retrieves relevant context for document-based queries using parallel
-        vector search operations.
+        vector search operations within the specific document's collection.
         """
-        logger.log_stage("Stage 4", "Context Retrieval")
+        logger.log_stage("Stage 4", "Context Retrieval", document_hash=document_hash)
         
         try:
             # Filter queries that need document context
@@ -239,7 +242,7 @@ class RAGPipeline:
             # Create retrieval tasks for parallel execution
             retrieval_tasks = []
             for analysis in doc_queries:
-                task = self._retrieve_context_for_query(analysis)
+                task = self._retrieve_context_for_query(analysis, document_hash)
                 retrieval_tasks.append(task)
             
             # Execute retrievals in parallel
@@ -260,12 +263,13 @@ class RAGPipeline:
             logger.error(f"Stage 4 failed: {str(e)}")
             raise
     
-    async def _retrieve_context_for_query(self, analysis: QueryAnalysis) -> str:
+    async def _retrieve_context_for_query(self, analysis: QueryAnalysis, document_hash: str) -> str:
         """
-        Retrieve context for a single query using vector search.
+        Retrieve context for a single query using vector search within document collection.
         
         Args:
             analysis: Query analysis with keywords
+            document_hash: Hash of the document to search within
             
         Returns:
             str: Combined context from retrieved chunks
@@ -276,15 +280,16 @@ class RAGPipeline:
                              query_id=analysis.query_id)
                 return ""
             
-            # Use vector search with keywords
+            # Use vector search with keywords within specific document
             chunks_and_scores = await vector_store.search_by_keywords(
-                analysis.keywords
+                analysis.keywords, document_hash
             )
             
             if not chunks_and_scores:
                 logger.warning("No context found for query",
                              query_id=analysis.query_id,
-                             keywords=analysis.keywords)
+                             keywords=analysis.keywords,
+                             document_hash=document_hash)
                 return ""
             
             # Combine chunk contents (de-duplicate if needed)
@@ -301,7 +306,8 @@ class RAGPipeline:
             logger.debug("Context retrieved for query",
                         query_id=analysis.query_id,
                         chunk_count=len(context_parts),
-                        context_length=len(context))
+                        context_length=len(context),
+                        document_hash=document_hash)
             
             return context
             

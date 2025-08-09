@@ -122,7 +122,7 @@ async def rag_exception_handler(request: Request, exc: RAGApplicationError):
     """Handle RAG application specific exceptions."""
     logger.error("RAG Application Error",
                 error_code=exc.error_code,
-                message=exc.message,
+                error_message=exc.message,  # Changed from 'message' to 'error_message'
                 details=exc.details)
     
     return JSONResponse(
