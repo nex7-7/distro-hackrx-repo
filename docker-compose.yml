@@ -47,14 +47,14 @@ services:
       GOOGLE_API_KEY: ${GOOGLE_API_KEY}
       LLM_MODEL: ${LLM_MODEL:-gemini-2.5-flash}
       WEAVIATE_CLASS_NAME: ${WEAVIATE_CLASS_NAME:-DocumentChunks}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
       MIN_CHUNK_SIZE: ${MIN_CHUNK_SIZE:-100}
       MAX_CHUNK_SIZE: ${MAX_CHUNK_SIZE:-1000}
       CHUNK_OVERLAP_PERCENTAGE: ${CHUNK_OVERLAP_PERCENTAGE:-5}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FILE: ${LOG_FILE:-logs/app.log}
-      MAX_WORKERS: ${MAX_WORKERS:-4}
-      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-5}
+      MAX_WORKERS: ${MAX_WORKERS:-8}
+      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-7}
     volumes:
       # Mount logs directory for persistence
       - ./logs:/app/logs
