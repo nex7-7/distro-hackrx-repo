@@ -63,11 +63,22 @@ class DocumentProcessor:
     
     def __init__(self) -> None:
         """Initialize the document processor."""
-        # Create timestamped download directory
+        # Create timestamped download directory with proper error handling
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         project_root = Path(__file__).parent.parent.parent  # Navigate to project root
-        self.downloads_dir = project_root / "downloads" / f"data_{timestamp}"
-        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            self.downloads_dir = project_root / "downloads" / f"data_{timestamp}"
+            self.downloads_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
+        except (PermissionError, OSError) as e:
+            # Fall back to temp directory if downloads directory is not writable
+            import tempfile
+            temp_dir = Path(tempfile.gettempdir()) / "rag_downloads" / f"data_{timestamp}"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            self.downloads_dir = temp_dir
+            logger.warning(f"Could not create downloads directory in {project_root / 'downloads'}: {e}. Using temporary directory: {self.downloads_dir}")
+        
+        logger.info(f"Downloads directory set to: {self.downloads_dir}")
         
         # Configure Tesseract path if specified
         if settings.tesseract_cmd:

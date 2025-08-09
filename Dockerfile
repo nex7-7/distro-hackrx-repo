@@ -45,7 +45,8 @@ RUN chmod +x start.sh
 RUN mkdir -p logs temp downloads cache && \
     chown -R ragapp:ragapp /app && \
     chmod -R 755 /app && \
-    chmod -R 777 logs temp downloads cache
+    chmod -R 777 logs temp downloads cache && \
+    ls -la /app/
 
 USER ragapp
 

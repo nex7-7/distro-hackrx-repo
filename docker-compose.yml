@@ -57,10 +57,10 @@ services:
       MAX_WORKERS: ${MAX_WORKERS:-8}
       RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-7}
     volumes:
-      # Mount temporary directories (optional, for debugging)
-      - ./temp:/app/temp
-      - ./downloads:/app/downloads
-      - ./cache:/app/cache
+      # Use named volumes to avoid permission issues
+      - rag_temp:/app/temp
+      - rag_cache:/app/cache
+      - rag_downloads:/app/downloads
       # Create a named volume for logs instead of bind mount
       - rag_logs:/tmp
     networks:
@@ -85,4 +85,13 @@ volumes:
     driver: local
   rag_logs:
     name: rag-logs
+    driver: local
+  rag_downloads:
+    name: rag-downloads
+    driver: local
+  rag_temp:
+    name: rag-temp
+    driver: local
+  rag_cache:
+    name: rag-cache
     driver: local
