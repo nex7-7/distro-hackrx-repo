@@ -865,16 +865,15 @@ def parse_pdf_with_pymupdf(pdf_content: bytes, document_id: str, filename: str) 
         raise HTTPException(status_code=503, detail=error_msg)
 
 
-def clean_and_rechunk_texts(chunk_texts: List[str], chunk_token_size: int = 1500, overlap: int = 225) -> List[str]:
+def clean_and_rechunk_texts(chunk_texts: List[str], chunk_token_size: int = 450, overlap: int = 30) -> List[str]:
     """
     Cleans up chunk texts and re-chunks them to a specified token size with overlap.
     Removes extra spaces and newlines, then combines chunks to reach the target token size.
-    If chunks are too small, combines them with consecutive chunks.
 
     Parameters:
         chunk_texts (List[str]): Original text chunks to process
-        chunk_token_size (int): Target token size for each chunk (default: 1500)
-        overlap (int): Number of tokens to overlap between chunks (default: 225 = 15% of 1500)
+        chunk_token_size (int): Target token size for each chunk
+        overlap (int): Number of tokens to overlap between chunks
 
     Returns:
         List[str]: List of cleaned and rechunked texts
@@ -922,90 +921,37 @@ def clean_and_rechunk_texts(chunk_texts: List[str], chunk_token_size: int = 1500
         "tokenization_time_seconds": tokenization_time
     })
 
-    # Perform rechunking with overlap and small chunk combination
+    # Perform rechunking with overlap
     rechunking_start = time.time()
     new_chunks = []
     i = 0
-    min_chunk_size = chunk_token_size // 3  # Minimum chunk size (500 tokens for 1500 target)
-    
     while i < len(tokens):
         chunk = tokens[i:i+chunk_token_size]
-        chunk_text = " ".join(chunk)
-        
-        # If this chunk is too small and we have a next chunk, try to combine
-        if len(chunk) < min_chunk_size and i + chunk_token_size < len(tokens):
-            # Try to combine with next chunk
-            next_chunk_size = min(chunk_token_size, len(tokens) - i - len(chunk))
-            extended_chunk = tokens[i:i + len(chunk) + next_chunk_size]
-            
-            # If combined chunk is still reasonable size, use it
-            if len(extended_chunk) <= chunk_token_size * 1.5:  # Allow up to 150% of target size
-                chunk_text = " ".join(extended_chunk)
-                i += len(extended_chunk) - overlap
-            else:
-                # Use original chunk and move forward normally
-                new_chunks.append(chunk_text)
-                i += len(chunk) - overlap
-        else:
-            # Normal chunking
-            new_chunks.append(chunk_text)
-            i += len(chunk) - overlap
-    
-    # Post-process to combine any remaining small chunks
-    final_chunks = []
-    i = 0
-    while i < len(new_chunks):
-        current_chunk = new_chunks[i]
-        current_tokens = len(current_chunk.split())
-        
-        # If current chunk is too small, try to combine with next
-        if current_tokens < min_chunk_size and i + 1 < len(new_chunks):
-            next_chunk = new_chunks[i + 1]
-            combined = current_chunk + " " + next_chunk
-            combined_tokens = len(combined.split())
-            
-            # If combined size is reasonable, use it and skip next chunk
-            if combined_tokens <= chunk_token_size * 1.5:
-                final_chunks.append(combined)
-                i += 2  # Skip next chunk as it's been combined
-            else:
-                final_chunks.append(current_chunk)
-                i += 1
-        else:
-            final_chunks.append(current_chunk)
-            i += 1
-    
-    new_chunks = final_chunks
+        new_chunks.append(" ".join(chunk))
+        i += chunk_token_size - overlap
     rechunking_time = time.time() - rechunking_start
 
     # Calculate rechunking statistics
     new_chunk_lengths = [len(chunk) for chunk in new_chunks]
     new_chunk_word_counts = [len(chunk.split()) for chunk in new_chunks]
-    min_chunk_tokens = min_chunk_size
-    small_chunks_count = sum(1 for count in new_chunk_word_counts if count < min_chunk_tokens)
 
     # Log rechunking completion with detailed statistics
     log_service_event("rechunking_complete", "Completed text rechunking process", {
         "rechunk_id": rechunk_id,
         "original_chunks": len(chunk_texts),
         "new_chunks": len(new_chunks),
-        "small_chunks_combined": small_chunks_count,
-        "min_chunk_size_tokens": min_chunk_tokens,
-        "target_chunk_size_tokens": chunk_token_size,
-        "overlap_tokens": overlap,
-        "overlap_percentage": round((overlap / chunk_token_size) * 100, 1),
         "rechunking_time_seconds": rechunking_time,
         "total_processing_time": time.time() - start_time,
         "avg_new_chunk_length": sum(new_chunk_lengths) / len(new_chunk_lengths) if new_chunk_lengths else 0,
         "max_new_chunk_length": max(new_chunk_lengths) if new_chunk_lengths else 0,
         "min_new_chunk_length": min(new_chunk_lengths) if new_chunk_lengths else 0,
-        "avg_tokens_per_chunk": sum(new_chunk_word_counts) / len(new_chunk_word_counts) if new_chunk_word_counts else 0,
+        "avg_tokens_per_chunk": chunk_token_size - overlap,
         "avg_words_per_chunk": sum(new_chunk_word_counts) / len(new_chunk_word_counts) if new_chunk_word_counts else 0,
         "total_chars": sum(new_chunk_lengths),
         "distribution": {
-            "small_chunks": sum(1 for length in new_chunk_lengths if length < 800),
-            "medium_chunks": sum(1 for length in new_chunk_lengths if 800 <= length < 2000),
-            "large_chunks": sum(1 for length in new_chunk_lengths if length >= 2000)
+            "short_chunks": sum(1 for length in new_chunk_lengths if length < 200),
+            "medium_chunks": sum(1 for length in new_chunk_lengths if 200 <= length < 500),
+            "long_chunks": sum(1 for length in new_chunk_lengths if length >= 500)
         }
     })
 
@@ -1679,9 +1625,9 @@ async def process_document_and_answer_questions(
     try:
         weaviate_client = await connect_to_weaviate()
         chunks = await fetch_and_parse_pdf(PARSING_API_URL, request.documents)
-        # Clean and rechunk with larger chunks and 15% overlap
+        # Clean and rechunk
         chunks = clean_and_rechunk_texts(
-            chunks, chunk_token_size=1500, overlap=225)
+            chunks, chunk_token_size=450, overlap=30)
         await ingest_to_weaviate(weaviate_client, collection_name, chunks)
 
         # Log successful ingestion
