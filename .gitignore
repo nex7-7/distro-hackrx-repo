@@ -45,7 +45,7 @@ htmlcov/
 Thumbs.db
 
 # GitHub (keeping this commented since we need it for instructions)
-.github
+# .github
 
 #
 huggingface_cache
