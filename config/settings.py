@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     # Logging Configuration
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
     log_file: str = Field(default="logs/app.log", env="LOG_FILE")
+    disable_file_logging: bool = Field(default=False, env="DISABLE_FILE_LOGGING")
     
     # Performance Configuration
     max_workers: int = Field(default=4, env="MAX_WORKERS")

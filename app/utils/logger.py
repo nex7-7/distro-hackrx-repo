@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 from datetime import datetime
 import sys
+import tempfile
 
 from config.settings import settings
 
@@ -49,14 +50,27 @@ class RAGLogger:
         )
         console_handler.setFormatter(console_formatter)
         
-        # Always add console handler
+        # Always add console handler first
         self.logger.addHandler(console_handler)
+        
+        # Skip file logging if disabled
+        if settings.disable_file_logging:
+            print("File logging disabled via configuration")
+            self.logger.setLevel(getattr(logging, settings.log_level.upper()))
+            return
         
         # Try to set up file handler with proper error handling
         try:
             # Create logs directory if it doesn't exist
             log_path = settings.log_file_path
-            log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            
+            # Try to create the directory with full permissions
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o777)
+            except (PermissionError, OSError):
+                # If we can't create in the default location, try /tmp
+                log_path = Path(tempfile.gettempdir()) / "app.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
             
             # File handler for persistent logging with rotation
             file_handler = logging.handlers.RotatingFileHandler(
@@ -72,11 +86,11 @@ class RAGLogger:
             )
             file_handler.setFormatter(file_formatter)
             self.logger.addHandler(file_handler)
+            print(f"Logging to file: {log_path}")
             
         except (PermissionError, OSError) as e:
-            # If we can't create the file handler, log to console only
-            console_handler.setLevel(logging.WARNING)
-            self.logger.warning(f"Could not create file handler for logging: {e}. Logging to console only.")
+            # If we can't create the file handler at all, log to console only
+            print(f"Warning: Could not create file handler for logging: {e}. Logging to console only.")
         
         # Set logger level
         self.logger.setLevel(getattr(logging, settings.log_level.upper()))

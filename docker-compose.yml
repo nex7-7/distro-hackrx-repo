@@ -52,16 +52,17 @@ services:
       MAX_CHUNK_SIZE: ${MAX_CHUNK_SIZE:-1000}
       CHUNK_OVERLAP_PERCENTAGE: ${CHUNK_OVERLAP_PERCENTAGE:-5}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      LOG_FILE: ${LOG_FILE:-logs/app.log}
+      LOG_FILE: ${LOG_FILE:-/tmp/app.log}
+      DISABLE_FILE_LOGGING: ${DISABLE_FILE_LOGGING:-false}
       MAX_WORKERS: ${MAX_WORKERS:-8}
       RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-7}
     volumes:
-      # Mount logs directory for persistence
-      - ./logs:/app/logs
       # Mount temporary directories (optional, for debugging)
       - ./temp:/app/temp
       - ./downloads:/app/downloads
       - ./cache:/app/cache
+      # Create a named volume for logs instead of bind mount
+      - rag_logs:/tmp
     networks:
       - rag-network
     depends_on:
@@ -81,4 +82,7 @@ networks:
 volumes:
   weaviate_data:
     name: rag-weaviate-data
+    driver: local
+  rag_logs:
+    name: rag-logs
     driver: local

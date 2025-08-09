@@ -7,7 +7,9 @@ WORKDIR /app
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    LOG_FILE=/tmp/app.log \
+    DISABLE_FILE_LOGGING=false
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -36,6 +38,9 @@ RUN groupadd -r ragapp && useradd -r -g ragapp ragapp
 # Copy application code
 COPY . .
 
+# Make start script executable
+RUN chmod +x start.sh
+
 # Create directories for logs and temporary files with proper ownership
 RUN mkdir -p logs temp downloads cache && \
     chown -R ragapp:ragapp /app && \
@@ -52,4 +57,4 @@ HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Command to run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["./start.sh"]
