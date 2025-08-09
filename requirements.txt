@@ -4,6 +4,7 @@ uvicorn
 
 # Pydantic for data validation
 pydantic
+pydantic-settings
 
 # Vector database
 weaviate-client

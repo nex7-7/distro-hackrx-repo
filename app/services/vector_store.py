@@ -15,7 +15,12 @@ import threading
 
 import weaviate
 from weaviate import Client
-from weaviate.exceptions import WeaviateException
+from weaviate.exceptions import (
+    WeaviateBaseError,
+    WeaviateConnectionError,
+    WeaviateQueryError,
+    WeaviateTimeoutError
+)
 
 from config.settings import settings
 from app.models.schemas import ChunkData, DocumentInfo
@@ -78,7 +83,7 @@ class VectorStore:
                         
                         logger.info("Successfully connected to Weaviate")
                         
-                    except WeaviateException as e:
+                    except WeaviateBaseError as e:
                         raise create_error(
                             VectorStoreError,
                             f"Failed to connect to Weaviate: {str(e)}",

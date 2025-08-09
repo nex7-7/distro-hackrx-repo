@@ -7,7 +7,8 @@ and automatically validated at startup.
 """
 
 from typing import Optional
-from pydantic import BaseSettings, Field
+from pydantic import Field
+from pydantic_settings import BaseSettings
 from pathlib import Path
 
 
@@ -26,7 +27,7 @@ class Settings(BaseSettings):
     
     # LLM Configuration
     google_api_key: str = Field(..., env="GOOGLE_API_KEY")
-    llm_model: str = Field(default="gemini-1.5-flash", env="LLM_MODEL")
+    llm_model: str = Field(default="gemini-2.5-flash", env="LLM_MODEL")
     
     # Weaviate Configuration
     weaviate_url: str = Field(default="http://localhost:8080", env="WEAVIATE_URL")
