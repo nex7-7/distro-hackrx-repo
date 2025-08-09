@@ -24,12 +24,11 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 # Import custom logger module
 from components.utils.logger import (
-    logger,
     setup_file_logging,
     log_api_request,
     log_api_response,
     log_error,
-    log_service_event
+    log_service_event,
 )
 
 # Import components

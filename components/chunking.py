@@ -74,6 +74,7 @@ def semantic_chunk_texts(
     # Group sentences into semantic chunks
     chunks = []
     current_chunk = [sentences[0]] if sentences else []
+    chunk_start_idx = 0
     for i in range(1, len(sentences)):
         prev_emb = sentence_embeddings[i-1]
         curr_emb = sentence_embeddings[i]
@@ -86,8 +87,11 @@ def semantic_chunk_texts(
             if len(current_chunk) < min_chunk_size and i < len(sentences)-1:
                 current_chunk.append(sentences[i])
             else:
+                # Add overlap: last 10% of sentences from previous chunk
+                overlap_count = max(1, int(0.1 * len(current_chunk)))
                 chunks.append(" ".join(current_chunk))
-                current_chunk = [sentences[i]]
+                # Prepare next chunk with overlap
+                current_chunk = current_chunk[-overlap_count:] + [sentences[i]]
     if current_chunk:
         chunks.append(" ".join(current_chunk))
 

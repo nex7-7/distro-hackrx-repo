@@ -15,7 +15,7 @@ from urllib.parse import urlparse, unquote
 from fastapi import HTTPException
 
 # Import local modules
-from components.utils.logger import logger, log_service_event, log_error
+from components.utils.logger import log_service_event, log_error
 # new engine, pdf parser
 from components.ingest_engine import ingest_from_url, Parser_Registry, parse_pdf_file
 

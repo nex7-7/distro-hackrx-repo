@@ -3,7 +3,6 @@ Reranker Utils Module
 
 This module contains utility functions for reranking search results.
 """
-import traceback
 from typing import List, Dict, Any
 
 
@@ -65,7 +64,6 @@ def diagnose_reranker_model(model, test_pairs=None):
         }
     except Exception as e:
         print(f"❌ Reranker diagnostic error: {e}")
-        traceback.print_exc()
         return {
             "success": False,
             "error": str(e)
