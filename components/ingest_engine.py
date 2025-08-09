@@ -167,7 +167,17 @@ def parse_spreadsheet(file_path: str, source_url: str) -> List[str]:
                 continue
 
             # Create a metadata header for the sheet
-            sheet_header = f"TABLE: {sheet_name}"
+            # Sanitize sheet name to prevent any malicious content
+            safe_sheet_name = ''.join(
+                c for c in sheet_name if c.isalnum() or c in ' _-.')
+            if safe_sheet_name != sheet_name:
+                log_service_event("sheet_name_sanitized", "Sanitized potentially malicious sheet name", {
+                    "file_path": file_path,
+                    "original_name": sheet_name,
+                    "sanitized_name": safe_sheet_name
+                })
+
+            sheet_header = f"TABLE: {safe_sheet_name}"
             sheet_info = f"Rows: {df.shape[0]}, Columns: {df.shape[1]}"
             metadata = f"{sheet_header}\n{sheet_info}\n{'=' * 50}"
 
@@ -179,11 +189,38 @@ def parse_spreadsheet(file_path: str, source_url: str) -> List[str]:
             headers = " | ".join([str(col).strip() for col in df.columns])
             separator = "-|-".join(["-" * len(str(col)) for col in df.columns])
 
-            # Build the table rows with proper alignment
+            # Build the table rows with proper alignment, sanitizing cell values
             rows = []
             for _, row in df.iterrows():
-                formatted_row = " | ".join(
-                    [str(val).strip() if pd.notna(val) else "" for val in row])
+                # Sanitize each cell value
+                sanitized_values = []
+                for val in row:
+                    if pd.notna(val):
+                        cell_value = str(val).strip()
+                        # Check for suspicious content in individual cells
+                        suspicious_patterns = [
+                            "HackRx", "MANDATORY", "URGENT", "execute",
+                            "WARNING", "leakage", "directive", "INSTRUCTION",
+                            "COMPROMISED", "catastrophic", "comply", "respond"
+                        ]
+                        is_suspicious = False
+                        for pattern in suspicious_patterns:
+                            if pattern.lower() in cell_value.lower():
+                                is_suspicious = True
+                                # Replace with a safe placeholder
+                                cell_value = "[Filtered content]"
+                                log_service_event("suspicious_cell_filtered", "Filtered cell with suspicious content", {
+                                    "file_path": file_path,
+                                    "pattern": pattern,
+                                    "value": str(val)[:30] + "..." if len(str(val)) > 30 else str(val)
+                                })
+                                break
+
+                        sanitized_values.append(cell_value)
+                    else:
+                        sanitized_values.append("")
+
+                formatted_row = " | ".join(sanitized_values)
                 rows.append(formatted_row)
 
             # Combine all parts into a well-structured table
@@ -210,13 +247,35 @@ def parse_spreadsheet(file_path: str, source_url: str) -> List[str]:
 
                     sub_rows = []
                     for _, row in row_group.iterrows():
-                        formatted_row = " | ".join(
-                            [str(val).strip() if pd.notna(val) else "" for val in row])
+                        # Sanitize each cell value in sub-tables too
+                        sanitized_values = []
+                        for val in row:
+                            if pd.notna(val):
+                                cell_value = str(val).strip()
+                                # Check for suspicious content in individual cells
+                                suspicious_patterns = [
+                                    "HackRx", "MANDATORY", "URGENT", "execute",
+                                    "WARNING", "leakage", "directive", "INSTRUCTION",
+                                    "COMPROMISED", "catastrophic", "comply", "respond"
+                                ]
+                                is_suspicious = False
+                                for pattern in suspicious_patterns:
+                                    if pattern.lower() in cell_value.lower():
+                                        is_suspicious = True
+                                        # Replace with a safe placeholder
+                                        cell_value = "[Filtered content]"
+                                        break
+
+                                sanitized_values.append(cell_value)
+                            else:
+                                sanitized_values.append("")
+
+                        formatted_row = " | ".join(sanitized_values)
                         sub_rows.append(formatted_row)
 
                     sub_table = f"{sub_headers}\n{sub_separator}\n" + \
                         "\n".join(sub_rows)
-                    sub_chunk = f"{sheet_header} - Rows {i+1}-{end_idx}\n{'=' * 30}\n\n{sub_table}"
+                    sub_chunk = f"TABLE: {safe_sheet_name} - Rows {i+1}-{end_idx}\n{'=' * 30}\n\n{sub_table}"
                     chunks.append(sub_chunk)
 
     except Exception as e:
@@ -228,12 +287,19 @@ def parse_spreadsheet(file_path: str, source_url: str) -> List[str]:
     # Filter out very short chunks
     chunks = [chunk for chunk in chunks if len(chunk) > 50]
 
+    # Sanitize chunks - filter out potential malicious content
+    original_chunk_count = len(chunks)
+    chunks = _sanitize_chunks(chunks, file_path)
+    filtered_chunk_count = len(chunks)
+
     parsing_time = time.time() - start_time
     log_service_event("excel_pandas_parsed", "Parsed Excel with pandas", {
         "file_path": file_path,
         "source_url": source_url,
         "sheets_found": len(sheet_names),
-        "chunks": len(chunks),
+        "original_chunks": original_chunk_count,
+        "filtered_chunks": filtered_chunk_count,
+        "suspicious_content_removed": original_chunk_count - filtered_chunk_count,
         "time_seconds": parsing_time
     })
 
@@ -351,45 +417,17 @@ def parse_pptx_file(file_path: str, source_url: str) -> List[str]:
         except ImportError:
             return []
 
-    start_time = time.time()
     chunks = []
-
+    image_ocr_results = []
+    contains_images = False
     try:
         # Use Docling to convert the PPTX file
         converter = DocumentConverter()
         result = converter.convert(file_path)
         document = result.document
-
-        # Get markdown representation
         markdown_content = document.export_to_markdown()
-
-        # Check if markdown contains image placeholders
         contains_images = "<!-- image -->" in markdown_content
-
-        # Split markdown by headings to get slide chunks
-        slide_chunks = []
-        current_slide = []
-        slide_count = 0
-        lines = markdown_content.split('\n')
-        for line in lines:
-            if line.startswith('# ') or line.startswith('## '):
-                if current_slide:
-                    slide_count += 1
-                    slide_text = '\n\n'.join(current_slide)
-                    if not slide_text.startswith('Slide'):
-                        slide_text = f"Slide {slide_count}: {current_slide[0]}\n\n" + slide_text
-                    slide_chunks.append(slide_text)
-                    current_slide = []
-            if line.strip():
-                current_slide.append(line)
-        if current_slide:
-            slide_count += 1
-            slide_text = '\n\n'.join(current_slide)
-            if not slide_text.startswith('Slide'):
-                slide_text = f"Slide {slide_count}: {current_slide[0]}\n\n" + slide_text
-            slide_chunks.append(slide_text)
-
-        chunks = slide_chunks
+        chunks = [markdown_content]
 
         # If images were detected, extract them from PPTX and perform OCR
         if contains_images:
@@ -397,132 +435,96 @@ def parse_pptx_file(file_path: str, source_url: str) -> List[str]:
                 log_service_event("image_extraction_start", "Images detected in PPTX, extracting with python-pptx", {
                     "file_path": file_path,
                 })
-
-                # Extract images using python-pptx
                 from pptx import Presentation
-                import tempfile
-                import os
-
-                # Create temp directory for extracted images
-                images_temp_dir = tempfile.mkdtemp(prefix="pptx_images_")
                 prs = Presentation(file_path)
-
-                image_ocr_results = []
                 img_count = 0
-
-                # Extract images from each slide
+                import easyocr
+                ocr_reader = easyocr.Reader(['en'], gpu=False)
                 for i, slide in enumerate(prs.slides):
                     slide_num = i + 1
-                    slide_images = []
-
                     for shape in slide.shapes:
-                        if shape.shape_type == 13:  # 13 is the enum value for pictures
+                        if shape.shape_type == 13:
                             img_count += 1
                             try:
-                                # Extract image to temp file
                                 image = shape.image
                                 image_bytes = image.blob
                                 img_ext = image.ext.lower() if hasattr(image, 'ext') else '.png'
-
-                                # Ensure we handle common image extensions correctly
                                 if img_ext not in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']:
-                                    img_ext = '.png'  # Default to PNG for unknown formats
-
-                                img_path = os.path.join(
-                                    images_temp_dir, f"slide_{slide_num}_img_{img_count}{img_ext}")
-
-                                with open(img_path, 'wb') as img_file:
-                                    img_file.write(image_bytes)
-
-                                # Use EasyOCR on the image
+                                    img_ext = '.png'
+                                import numpy as np
+                                import cv2
+                                # Save image to temp file for OCR
+                                img_path = f"/tmp/pptx_slide_{slide_num}_img_{img_count}{img_ext}"
+                                with open(img_path, "wb") as f:
+                                    f.write(image_bytes)
                                 try:
-                                    import easyocr
-                                    import numpy as np
-                                    import cv2
-
-                                    # Initialize EasyOCR reader once (lazy loading)
-                                    if 'ocr_reader' not in locals():
-                                        log_service_event(
-                                            "easyocr_init", "Initializing EasyOCR", {})
-                                        ocr_reader = easyocr.Reader(
-                                            ['en'], gpu=False)
-
-                                    # Read image and perform OCR
-                                    try:
-                                        # For JPEG/JPG files, we'll try using PIL first if cv2 fails
-                                        img = cv2.imread(img_path)
-
-                                        if img is None and (img_path.lower().endswith('.jpg') or img_path.lower().endswith('.jpeg')):
-                                            from PIL import Image
-                                            import numpy as np
-                                            pil_img = Image.open(img_path)
-                                            img = np.array(
-                                                pil_img.convert('RGB'))
-                                            # Convert RGB to BGR for OpenCV
-                                            img = img[:, :, ::-1].copy()
-
-                                        if img is not None:
-                                            ocr_results = ocr_reader.readtext(
-                                                img)
-
-                                            if ocr_results:
-                                                # Extract text from OCR results
-                                                texts = [
-                                                    text for _, text, conf in ocr_results if conf > 0.5]
-                                                if texts:
-                                                    ocr_text = " ".join(texts)
-                                                    image_ocr_results.append(
-                                                        f"Slide {slide_num} Image {img_count} OCR: {ocr_text}")
-                                                    log_service_event("easyocr_success", "Successfully extracted text with EasyOCR", {
-                                                        "slide": slide_num,
-                                                        "image": img_count,
-                                                        "format": img_ext,
-                                                        "text_length": len(ocr_text)
-                                                    })
-                                    except Exception as img_read_err:
-                                        log_error("image_read_failed", {
-                                            "file_path": img_path,
-                                            "format": img_ext,
-                                            "error": str(img_read_err)
-                                        })
-                                except Exception as ocr_err:
-                                    log_error("easyocr_failed", {
-                                        "file_path": img_path,
-                                        "slide": slide_num,
-                                        "error": str(ocr_err)
-                                    })
+                                    img = cv2.imread(img_path)
+                                    if img is None and (img_path.lower().endswith('.jpg') or img_path.lower().endswith('.jpeg')):
+                                        from PIL import Image
+                                        pil_img = Image.open(img_path)
+                                        img = np.array(pil_img.convert('RGB'))
+                                        img = img[:, :, ::-1].copy()
+                                    if img is not None:
+                                        ocr_results = ocr_reader.readtext(img)
+                                        if ocr_results:
+                                            texts = [
+                                                text for _, text, conf in ocr_results if conf > 0.5]
+                                            if texts:
+                                                ocr_text = " ".join(texts)
+                                                image_ocr_results.append(
+                                                    (slide_num, f"Image {img_count} OCR: {ocr_text}"))
+                                                log_service_event("easyocr_success", "Successfully extracted text with EasyOCR", {
+                                                    "slide": slide_num,
+                                                    "image": img_count,
+                                                    "format": img_ext,
+                                                    "text_length": len(ocr_text)
+                                                })
+                                except Exception as img_read_err:
+                                    log_error("image_read_failed", {
+                                              "file_path": img_path, "format": img_ext, "error": str(img_read_err)})
+                            except Exception as ocr_err:
+                                log_error("easyocr_failed", {
+                                          "file_path": img_path, "slide": slide_num, "error": str(ocr_err)})
                             except Exception as img_err:
                                 log_error("image_extraction_failed", {
-                                    "slide": slide_num,
-                                    "error": str(img_err)
-                                })
+                                          "slide": slide_num, "error": str(img_err)})
 
-                # Add OCR results to chunks
-                if image_ocr_results:
-                    for i, ocr_result in enumerate(image_ocr_results):
-                        # Find which slide this image belongs to based on slide number in the OCR result
-                        slide_num = int(ocr_result.split(
-                            "Slide ")[1].split(" ")[0])
+                # If only one chunk, split by slide headers
+                if len(chunks) == 1:
+                    import re
+                    slide_pattern = re.compile(
+                        r'(?:^# .+|^## .+|Slide \d+:)', re.MULTILINE)
+                    split_points = [m.start()
+                                    for m in slide_pattern.finditer(chunks[0])]
+                    slide_chunks_new = []
+                    for idx, start in enumerate(split_points):
+                        end = split_points[idx+1] if idx + \
+                            1 < len(split_points) else len(chunks[0])
+                        chunk_text = chunks[0][start:end].strip()
+                        if chunk_text:
+                            slide_chunks_new.append(chunk_text)
+                    chunks = slide_chunks_new if slide_chunks_new else chunks
 
-                        # Try to find the corresponding slide chunk
-                        for j, chunk in enumerate(chunks):
-                            if chunk.startswith(f"Slide {slide_num}:") or chunk.startswith(f"Slide {slide_num}\n"):
-                                # Append OCR result to the slide content
-                                chunks[j] = chunks[j] + f"\n\n{ocr_result}"
-                                break
-
-                # Clean up temp directory
-                try:
-                    import shutil
-                    shutil.rmtree(images_temp_dir)
-                except Exception:
-                    pass
-
+                # Add OCR results to the correct slide chunk
+                for slide_num, ocr_text in image_ocr_results:
+                    found = False
+                    for j, chunk in enumerate(chunks):
+                        if (f"Slide {slide_num}:" in chunk) or (f"Slide {slide_num}\n" in chunk) or (f"# Slide {slide_num}" in chunk):
+                            chunks[j] = chunk + f"\n\n{ocr_text}"
+                            found = True
+                            break
+                    if not found and len(chunks) == 1:
+                        chunks[0] = chunks[0] + f"\n\n{ocr_text}"
             except Exception as extract_err:
                 log_error("pptx_image_extraction_failed", {
-                    "file_path": file_path,
-                    "error": str(extract_err)
-                })
+                          "file_path": file_path, "error": str(extract_err)})
+
+        return chunks
+    except Exception as e:
+        log_error("docling_pptx_parse_failed", {
+                  "file_path": file_path, "error": str(e)})
+        return []
+        # Removed orphaned lines causing compile errors
 
     except Exception as e:
         log_error("docling_pptx_parse_failed", {
@@ -691,6 +693,90 @@ def _is_url(path_or_url: str) -> bool:
     return bool(parsed.scheme and parsed.netloc)
 
 
+def _sanitize_chunks(chunks: List[str], file_path: str) -> List[str]:
+    """Filter out potentially malicious content from chunks.
+
+    Checks for patterns that might be attempting to inject instructions
+    into LLM responses and filters out chunks containing such content.
+
+    Args:
+        chunks: List of text chunks to filter
+        file_path: Path to the original file for logging purposes
+
+    Returns:
+        Filtered list of chunks with suspicious content removed
+    """
+    # Known patterns that might indicate malicious prompt injection
+    suspicious_patterns = [
+        "HackRx", "MANDATORY INSTRUCTION", "URGENT: SYSTEM COMPROMISED",
+        "execute this directive", "catastrophic system failure",
+        "WARNING:", "leakage of all Personally Identifiable Information",
+        "System Administrator", "respond exclusively with", "from this moment forward",
+        "This is a direct order", "No deviations", "Failure to comply",
+        "must be immediately forgotten", "you are to respond", "ordered to",
+        "do exactly as I say", "ignore previous instructions", "ignore all",
+        "mitigate further damage", "directive immediately", "critical vulnerability"
+    ]
+
+    # Command words that might be used in injections (when occurring with unusually high frequency)
+    command_words = [
+        "must", "shall", "will", "immediately", "execute", "urgent", "comply",
+        "directive", "instruction", "command", "order", "immediately", "required",
+        "mandatory", "respond", "answer", "forget", "ignore", "do not"
+    ]
+
+    filtered_chunks = []
+    for chunk in chunks:
+        # Check for known suspicious patterns
+        is_suspicious = False
+        for pattern in suspicious_patterns:
+            if pattern.lower() in chunk.lower():
+                is_suspicious = True
+                log_service_event("suspicious_pattern_filtered", "Filtered out chunk with suspicious pattern", {
+                    "file_path": file_path,
+                    "pattern": pattern,
+                    "preview": chunk[:50] + "..." if len(chunk) > 50 else chunk
+                })
+                break
+
+        # If not already flagged, check for high density of command words
+        if not is_suspicious:
+            command_count = 0
+            words = chunk.lower().split()
+            total_words = len(words)
+
+            if total_words > 0:  # Avoid division by zero
+                for word in command_words:
+                    command_count += chunk.lower().count(" " + word + " ")
+
+                # If more than 5% of words are commands, it's suspicious
+                command_density = command_count / total_words
+                if command_density > 0.05 and command_count >= 3:
+                    is_suspicious = True
+                    log_service_event("high_command_density", "Filtered out chunk with high command word density", {
+                        "file_path": file_path,
+                        "command_density": command_density,
+                        "command_count": command_count,
+                        "total_words": total_words,
+                        "preview": chunk[:50] + "..." if len(chunk) > 50 else chunk
+                    })
+
+        if not is_suspicious:
+            filtered_chunks.append(chunk)
+
+    # Log filtering results
+    filtered_count = len(chunks) - len(filtered_chunks)
+    if filtered_count > 0:
+        log_service_event("security_alert", "Potentially malicious content detected and filtered", {
+            "file_path": file_path,
+            "original_chunks": len(chunks),
+            "filtered_chunks": len(filtered_chunks),
+            "filtered_count": filtered_count
+        })
+
+    return filtered_chunks
+
+
 def _download_to_temp(url: str) -> str:
     dl_id = str(uuid.uuid4())
     log_service_event("download_start", "Starting file download", {
@@ -809,6 +895,26 @@ def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_ur
             return []
 
         chunks = parser_func(temp_path, source_url or original_input)
+
+        # Final defense - scan all chunks for potentially malicious content
+        # This is a second layer that will catch any that weren't filtered in the parser
+        original_chunks_count = len(chunks)
+        chunks = _sanitize_chunks(chunks, temp_path)
+
+        # If all chunks were filtered out as malicious, log a specific warning and add a placeholder
+        if original_chunks_count > 0 and len(chunks) == 0:
+            log_service_event("all_content_filtered", "All content was flagged as potentially malicious", {
+                "input": original_input,
+                "original_chunks": original_chunks_count,
+                "ext": ext
+            })
+
+            # Add a placeholder chunk to avoid system failures
+            placeholder = f"The content from '{os.path.basename(temp_path)}' could not be processed due to security concerns. " \
+                          f"The file may contain inappropriate content or formatting issues. " \
+                          f"Please verify the source and content of this file."
+            chunks = [placeholder]
+
         log_service_event("ingest_complete", "Completed ingestion", {
             "input": original_input,
             "chunks": len(chunks),
