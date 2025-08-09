@@ -431,7 +431,7 @@ async def process_document_and_answer_questions(
                 print(f"❌ Document ingestion failed: {he.detail}")
                 
                 # Return "Files Not found" for security violations or processing errors
-                answers = ["Files Not found"] * len(questions)
+                answers = ["Incorrect file type submitted"] * len(questions)
                 
                 processing_time = time.time() - start_time
                 log_api_response(
