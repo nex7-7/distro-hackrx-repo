@@ -51,6 +51,9 @@ class EmbeddingService:
         self.model: Optional[SentenceTransformer] = None
         self.model_name = settings.embedding_model
         
+        # Setup cache directories for HuggingFace models
+        self._setup_cache_directories()
+        
         # Use a more conservative thread pool to avoid resource contention
         max_workers = max(1, min(settings.max_workers, 4))  # Cap at 4 for embedding
         self.executor = ThreadPoolExecutor(
@@ -62,6 +65,49 @@ class EmbeddingService:
         logger.info("Embedding service initialized", 
                    model=self.model_name,
                    max_workers=max_workers)
+    
+    def _setup_cache_directories(self) -> None:
+        """Setup cache directories for HuggingFace models."""
+        import os
+        import tempfile
+        from pathlib import Path
+        
+        # Try to create cache directories in the designated app cache location
+        cache_base = Path("/app/cache/huggingface")
+        
+        try:
+            cache_base.mkdir(parents=True, exist_ok=True, mode=0o777)
+            (cache_base / "transformers").mkdir(exist_ok=True)
+            (cache_base / "sentence_transformers").mkdir(exist_ok=True)
+            
+            # Also setup torch cache
+            torch_cache = Path("/app/cache/torch")
+            torch_cache.mkdir(parents=True, exist_ok=True, mode=0o777)
+            
+            # Set environment variables for HuggingFace libraries
+            os.environ["HF_HOME"] = str(cache_base)
+            os.environ["TRANSFORMERS_CACHE"] = str(cache_base / "transformers")
+            os.environ["SENTENCE_TRANSFORMERS_HOME"] = str(cache_base / "sentence_transformers")
+            os.environ["TORCH_HOME"] = str(torch_cache)
+            
+            logger.info("HuggingFace cache directories configured", cache_dir=str(cache_base))
+            
+        except (PermissionError, OSError) as e:
+            # Fall back to temp directory
+            temp_cache = Path(tempfile.gettempdir()) / "huggingface_cache"
+            temp_cache.mkdir(parents=True, exist_ok=True)
+            (temp_cache / "transformers").mkdir(exist_ok=True)
+            (temp_cache / "sentence_transformers").mkdir(exist_ok=True)
+            
+            torch_temp_cache = Path(tempfile.gettempdir()) / "torch_cache"
+            torch_temp_cache.mkdir(parents=True, exist_ok=True)
+            
+            os.environ["HF_HOME"] = str(temp_cache)
+            os.environ["TRANSFORMERS_CACHE"] = str(temp_cache / "transformers")
+            os.environ["SENTENCE_TRANSFORMERS_HOME"] = str(temp_cache / "sentence_transformers")
+            os.environ["TORCH_HOME"] = str(torch_temp_cache)
+            
+            logger.warning(f"Could not create app cache directory: {e}. Using temp cache: {temp_cache}")
     
     def _load_model(self) -> SentenceTransformer:
         """

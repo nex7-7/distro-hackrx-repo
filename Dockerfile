@@ -9,7 +9,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     LOG_FILE=/tmp/app.log \
-    DISABLE_FILE_LOGGING=false
+    DISABLE_FILE_LOGGING=false \
+    HF_HOME=/app/cache/huggingface \
+    TRANSFORMERS_CACHE=/app/cache/huggingface/transformers \
+    SENTENCE_TRANSFORMERS_HOME=/app/cache/huggingface/sentence_transformers \
+    TORCH_HOME=/app/cache/torch
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -33,7 +37,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Create non-root user for security first
-RUN groupadd -r ragapp && useradd -r -g ragapp ragapp
+RUN groupadd -r ragapp && useradd -r -g ragapp ragapp --home-dir /home/ragapp --create-home && \
+    mkdir -p /home/ragapp/.cache && \
+    chown -R ragapp:ragapp /home/ragapp
 
 # Copy application code
 COPY . .
@@ -42,7 +48,7 @@ COPY . .
 RUN chmod +x start.sh
 
 # Create directories for logs and temporary files with proper ownership
-RUN mkdir -p logs temp downloads cache && \
+RUN mkdir -p logs temp downloads cache cache/huggingface cache/huggingface/transformers cache/huggingface/sentence_transformers cache/torch && \
     chown -R ragapp:ragapp /app && \
     chmod -R 755 /app && \
     chmod -R 777 logs temp downloads cache && \

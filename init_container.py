@@ -14,7 +14,11 @@ def setup_directories():
         ('logs', os.getenv('LOG_FILE', 'logs/app.log')),
         ('downloads', '/app/downloads'),
         ('temp', '/app/temp'),
-        ('cache', '/app/cache')
+        ('cache', '/app/cache'),
+        ('huggingface_cache', '/app/cache/huggingface'),
+        ('transformers_cache', '/app/cache/huggingface/transformers'),
+        ('sentence_transformers_cache', '/app/cache/huggingface/sentence_transformers'),
+        ('torch_cache', '/app/cache/torch')
     ]
     
     for dir_name, dir_path in directories:
@@ -31,7 +35,7 @@ def setup_directories():
             test_file.touch()
             test_file.unlink()
             
-            print(f"✓ {dir_name.capitalize()} directory ready: {path}")
+            print(f"✓ {dir_name.replace('_', ' ').capitalize()} directory ready: {path}")
             
         except (PermissionError, OSError) as e:
             if dir_name == 'downloads':
