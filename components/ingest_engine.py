@@ -137,8 +137,74 @@ def parse_standard_document(file_path: str, source_url: str) -> List[str]:
 
 
 def parse_spreadsheet(file_path: str, source_url: str) -> List[str]:
-    """Parse spreadsheet (.xlsx) into list[str] via unstructured (if available)."""
-    return parse_standard_document(file_path, source_url)
+    """Parse spreadsheet (.xlsx) into list[str] using pandas.
+
+    Each sheet will be processed separately, and columns/rows will be formatted
+    with appropriate headers.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        log_error("pandas_import_failed", {
+                  "file_path": file_path, "error": "pandas not installed"})
+        # Fall back to standard parser
+        return parse_standard_document(file_path, source_url)
+
+    start_time = time.time()
+    chunks = []
+
+    try:
+        # Read all sheets from the Excel file
+        xl = pd.ExcelFile(file_path)
+        sheet_names = xl.sheet_names
+
+        for sheet_name in sheet_names:
+            # Read each sheet into a dataframe
+            df = pd.read_excel(file_path, sheet_name=sheet_name)
+
+            # Skip empty sheets
+            if df.empty:
+                continue
+
+            # Format the sheet content
+            sheet_header = f"Sheet: {sheet_name}"
+
+            # Convert DataFrame to a formatted string with headers and rows
+            table_str = df.to_string(index=False)
+
+            # Add to chunks with appropriate headers
+            chunks.append(f"{sheet_header}\n\n{table_str}")
+
+            # If the sheet is large, create additional chunks with specific column groups
+            # to improve search relevance
+            if df.shape[1] > 5:  # More than 5 columns
+                # Process column groups to create additional chunks for better searchability
+                for i in range(0, len(df.columns), 3):
+                    col_group = df.iloc[:, i:i+3]
+                    if not col_group.empty:
+                        group_str = col_group.to_string(index=False)
+                        chunks.append(
+                            f"{sheet_name} (columns {i+1}-{i+3}):\n\n{group_str}")
+
+    except Exception as e:
+        log_error("excel_pandas_parse_failed", {
+                  "file_path": file_path, "error": str(e)})
+        # Fall back to standard parser
+        return parse_standard_document(file_path, source_url)
+
+    # Filter out very short chunks
+    chunks = [chunk for chunk in chunks if len(chunk) > 50]
+
+    parsing_time = time.time() - start_time
+    log_service_event("excel_pandas_parsed", "Parsed Excel with pandas", {
+        "file_path": file_path,
+        "source_url": source_url,
+        "sheets_found": len(sheet_names),
+        "chunks": len(chunks),
+        "time_seconds": parsing_time
+    })
+
+    return chunks
 
 
 def parse_image_with_ocr(file_path: str, source_url: str) -> List[str]:
@@ -228,6 +294,39 @@ def parse_pdf_file(file_path: str, source_url: str) -> List[str]:
         return []
 
 
+# --- PPTX Parser ---
+def parse_pptx_file(file_path: str, source_url: str) -> List[str]:
+    """Parse PPTX file and return list of text chunks (one per slide)."""
+    try:
+        from pptx import Presentation
+    except ImportError:
+        log_error("pptx_import_failed", {
+                  "file_path": file_path, "error": "python-pptx not installed"})
+        return []
+    chunks = []
+    try:
+        prs = Presentation(file_path)
+        for slide in prs.slides:
+            slide_text = []
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    txt = shape.text.strip()
+                    if txt:
+                        slide_text.append(txt)
+            if slide_text:
+                chunks.append("\n".join(slide_text))
+    except Exception as e:
+        log_error("pptx_parse_failed", {
+                  "file_path": file_path, "error": str(e)})
+        return []
+    log_service_event("pptx_parsed", "Parsed PPTX file", {
+        "file_path": file_path,
+        "source_url": source_url,
+        "chunks": len(chunks)
+    })
+    return chunks
+
+
 # ------------------------------ Parser Registry ------------------------------
 Parser_Registry: Dict[str, Callable[[str, str], List[str]]] = {
     "xlsx": parse_spreadsheet,
@@ -237,6 +336,7 @@ Parser_Registry: Dict[str, Callable[[str, str], List[str]]] = {
     "pdf": parse_pdf_file,
     "docx": parse_standard_document,
     "txt": parse_standard_document,
+    "pptx": parse_pptx_file,
 }
 
 # ------------------------------ Helper Functions ------------------------------
