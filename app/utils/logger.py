@@ -40,10 +40,6 @@ class RAGLogger:
     
     def _setup_handlers(self) -> None:
         """Setup console and file handlers with proper formatting."""
-        # Create logs directory if it doesn't exist
-        log_path = settings.log_file_path
-        log_path.parent.mkdir(exist_ok=True)
-        
         # Console handler for immediate feedback
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.INFO)
@@ -53,23 +49,37 @@ class RAGLogger:
         )
         console_handler.setFormatter(console_formatter)
         
-        # File handler for persistent logging with rotation
-        file_handler = logging.handlers.RotatingFileHandler(
-            filename=log_path,
-            maxBytes=10 * 1024 * 1024,  # 10MB
-            backupCount=5,
-            encoding='utf-8'
-        )
-        file_handler.setLevel(getattr(logging, settings.log_level.upper()))
-        file_formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        file_handler.setFormatter(file_formatter)
-        
-        # Add handlers to logger
+        # Always add console handler
         self.logger.addHandler(console_handler)
-        self.logger.addHandler(file_handler)
+        
+        # Try to set up file handler with proper error handling
+        try:
+            # Create logs directory if it doesn't exist
+            log_path = settings.log_file_path
+            log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            
+            # File handler for persistent logging with rotation
+            file_handler = logging.handlers.RotatingFileHandler(
+                filename=log_path,
+                maxBytes=10 * 1024 * 1024,  # 10MB
+                backupCount=5,
+                encoding='utf-8'
+            )
+            file_handler.setLevel(getattr(logging, settings.log_level.upper()))
+            file_formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            file_handler.setFormatter(file_formatter)
+            self.logger.addHandler(file_handler)
+            
+        except (PermissionError, OSError) as e:
+            # If we can't create the file handler, log to console only
+            console_handler.setLevel(logging.WARNING)
+            self.logger.warning(f"Could not create file handler for logging: {e}. Logging to console only.")
+        
+        # Set logger level
+        self.logger.setLevel(getattr(logging, settings.log_level.upper()))
     
     def debug(self, message: str, **kwargs) -> None:
         """Log debug message with optional context."""

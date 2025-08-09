@@ -30,15 +30,18 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+# Create non-root user for security first
+RUN groupadd -r ragapp && useradd -r -g ragapp ragapp
+
 # Copy application code
 COPY . .
 
-# Create directories for logs and temporary files
-RUN mkdir -p logs temp downloads cache
+# Create directories for logs and temporary files with proper ownership
+RUN mkdir -p logs temp downloads cache && \
+    chown -R ragapp:ragapp /app && \
+    chmod -R 755 /app && \
+    chmod -R 777 logs temp downloads cache
 
-# Create non-root user for security
-RUN groupadd -r ragapp && useradd -r -g ragapp ragapp && \
-    chown -R ragapp:ragapp /app
 USER ragapp
 
 # Expose port
