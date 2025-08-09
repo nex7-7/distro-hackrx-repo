@@ -11,7 +11,9 @@ Rag_Baj is a high-performance Retrieval-Augmented Generation (RAG) API that inge
 - ZIP archive extraction and recursive ingestion
 - PDF parsing with PyMuPDF
 - Image OCR via `unstructured` library (if available)
-- Semantic chunking and embedding creation
+- Semantic chunking with 10% overlap for better context
+- Embedding creation and vector storage
+- Two-stage retrieval: hybrid search + reranking with BAAI/bge-reranker-base
 - FastAPI-based API endpoints for document and query processing
 - Detailed logging and error handling
 
@@ -48,8 +50,9 @@ main.py               # FastAPI app and endpoints
 2. **Query Processing**
    - Accepts user queries via API.
    - Generates query embeddings.
-   - Performs hybrid search in Weaviate (vector + keyword).
-   - Reranks results if enabled.
+   - Performs hybrid search in Weaviate (vector + keyword) to fetch 25 chunks.
+   - Reranks the 25 chunks using BAAI/bge-reranker-base model.
+   - Selects top 15 reranked chunks for context.
    - Formats context and sends to LLM for answer generation.
 
 ## Setup & Usage
@@ -82,16 +85,17 @@ flowchart TD
     E -- Image --> G[Parse Image with OCR]
     E -- Spreadsheet --> H[Parse Spreadsheet]
     E -- Text/Docx --> I[Parse Standard Document]
-    F & G & H & I --> J[Chunk Text]
+    F & G & H & I --> J[Semantic Chunk Text with 10% Overlap]
     J --> K[Create Embeddings]
     K --> L[Store in Weaviate]
     L --> M[User Query]
     M --> N[Create Query Embedding]
-    N --> O[Hybrid Search in Weaviate]
-    O --> P[Rerank Results]
-    P --> Q[Format Context]
-    Q --> R[Send to LLM]
-    R --> S[Return Answer]
+    N --> O[Hybrid Search: Get 25 Chunks from Weaviate]
+    O --> P[Rerank with BAAI/bge-reranker-base]
+    P --> Q[Select Top 15 Chunks]
+    Q --> R[Format Context for LLM]
+    R --> S[Send to LLM]
+    S --> T[Return Answer]
 ```
 
 ## Notes

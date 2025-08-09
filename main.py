@@ -61,8 +61,8 @@ AUTH_TOKEN = os.getenv(
     "AUTH_TOKEN", "fd8defb3118175da9553e106c05f40bc476971f0b46a400db1e625eaffa1fc08")
 
 # RAG pipeline configuration
-INITIAL_RETRIEVAL_K = 15  # Increased from 13 to retrieve more candidates for reranking
-TOP_K_RESULTS = 8  # Keep only the top K results after reranking
+INITIAL_RETRIEVAL_K = 25  # Fetch more candidates for reranking
+TOP_K_RESULTS = 15  # Keep top 15 results after reranking for LLM
 RERANKER_THRESHOLD = 0.3  # Minimum score threshold for chunks after reranking
 CACHE_DIR = "./huggingface_cache"
 MODEL_NAME = os.getenv("EMBEDDING_MODEL", 'BAAI/bge-base-en-v1.5')
@@ -84,7 +84,7 @@ PARSING_API_URL = os.getenv(
 
 # Load reranker model name
 RERANKER_MODEL_NAME = os.getenv(
-    "RERANKER_MODEL", 'cross-encoder/ms-marco-MiniLM-L-6-v2')
+    "RERANKER_MODEL", 'BAAI/bge-reranker-base')
 
 # Global dictionary to store ML models and clients
 ml_models = {}
@@ -108,7 +108,16 @@ async def lifespan(app: FastAPI):
     print("✅ Embedding model loaded.")
     log_service_event("model_loaded", f"Embedding model loaded: {MODEL_NAME}")
 
-    # Reranker model loading removed (not used in pipeline)
+    # Load reranker model
+    print(f"🤖 Loading reranker model '{RERANKER_MODEL_NAME}'...")
+    log_service_event(
+        "reranker_loading", f"Loading reranker model: {RERANKER_MODEL_NAME}")
+    from sentence_transformers import CrossEncoder
+    ml_models['reranker_model'] = CrossEncoder(
+        RERANKER_MODEL_NAME, device='cpu')
+    print("✅ Reranker model loaded.")
+    log_service_event("reranker_loaded",
+                      f"Reranker model loaded: {RERANKER_MODEL_NAME}")
 
     # Connect to Weaviate once during startup
     global weaviate_client
@@ -252,7 +261,7 @@ async def process_single_question(
             query_vector=query_vector,
             collection_name=collection_name,
             weaviate_client=weaviate_client,
-            limit=TOP_K_RESULTS,
+            limit=INITIAL_RETRIEVAL_K,  # Get 25 chunks for reranking
             alpha=0.5  # Balance between vector and keyword search
         )
     except ConnectionError as e:
@@ -273,7 +282,7 @@ async def process_single_question(
                 query_vector=query_vector,
                 collection_name=collection_name,
                 weaviate_client=weaviate_client,
-                limit=TOP_K_RESULTS,
+                limit=INITIAL_RETRIEVAL_K,  # Get 25 chunks for reranking
                 alpha=0.5
             )
         except Exception as retry_error:
@@ -283,8 +292,41 @@ async def process_single_question(
             })
             context_chunks, chunk_ids, chunk_scores = [], [], []
 
+    # Rerank chunks if we have results
+    if context_chunks and len(context_chunks) > TOP_K_RESULTS:
+        reranker_start = time.time()
+        reranker_model = ml_models['reranker_model']
+
+        # Create query-chunk pairs for reranking
+        query_chunk_pairs = [[question, chunk] for chunk in context_chunks]
+
+        # Get reranking scores
+        rerank_scores = reranker_model.predict(query_chunk_pairs)
+
+        # Sort by reranking scores and take top K
+        ranked_indices = sorted(range(len(rerank_scores)),
+                                key=lambda i: rerank_scores[i], reverse=True)
+        top_indices = ranked_indices[:TOP_K_RESULTS]
+
+        # Reorder chunks based on reranking
+        context_chunks = [context_chunks[i] for i in top_indices]
+        chunk_ids = [chunk_ids[i] for i in top_indices] if chunk_ids else []
+        chunk_scores = [float(rerank_scores[i]) for i in top_indices]
+
+        reranker_time = time.time() - reranker_start
+        log_service_event("reranking_complete", "Chunks reranked successfully", {
+            "question_id": question_id,
+            "initial_chunks": len(query_chunk_pairs),
+            "final_chunks": len(context_chunks),
+            "reranking_time_seconds": reranker_time,
+            "top_rerank_score": max(chunk_scores) if chunk_scores else 0,
+            "avg_rerank_score": sum(chunk_scores) / len(chunk_scores) if chunk_scores else 0
+        })
+        print(
+            f"🔄 Reranked {len(query_chunk_pairs)} chunks → top {len(context_chunks)} selected")
+
     print(
-        f"🔍 Using top {len(context_chunks)} chunks directly from vector search")
+        f"🔍 Using top {len(context_chunks)} chunks for LLM context")
 
     if not context_chunks:
         answer_text = "Based on the provided documents, I cannot find any relevant information to answer this question."
