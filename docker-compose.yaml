@@ -1,5 +1,22 @@
 version: '3.8'
 services:
+  app:
+    build: .
+    ports:
+      - 8000:8000
+    volumes:
+      - .:/app
+    depends_on:
+      - weaviate
+    environment:
+      - WEAVIATE_URL=http://weaviate:8080
+    # Install tesseract-ocr and its language data
+    command: >
+      sh -c "apt-get update && 
+             apt-get install -y tesseract-ocr tesseract-ocr-eng &&
+             python -m pip install -r requirements.txt &&
+             uvicorn main:app --host 0.0.0.0 --port 8000"
+
   weaviate:
     command:
       - --host

@@ -241,19 +241,88 @@ def parse_spreadsheet(file_path: str, source_url: str) -> List[str]:
 
 
 def parse_image_with_ocr(file_path: str, source_url: str) -> List[str]:
-    """Parse image using unstructured (which may invoke OCR if deps present).
-
-    If OCR backend not available, returns empty list (logged) instead of failing.
+    """Parse image using multiple OCR methods in a fallback chain:
+    1. Try unstructured's default OCR (may use EasyOCR)
+    2. Try unstructured with explicit tesseract mode
+    3. Try direct tesseract if available
+    4. Return empty list if all methods fail
     """
+    chunks = []
+
+    # First try: Unstructured's default OCR
+    if _UNSTRUCTURED_AVAILABLE:
+        try:
+            elements = _unstructured_partition(filename=file_path,
+                                               include_page_breaks=False,
+                                               strategy='auto',
+                                               languages=["eng"]) or []
+            for el in elements:
+                text = str(el).strip()
+                if text:
+                    chunks.append(text)
+            if chunks:
+                log_service_event("image_ocr_success", "Successfully extracted text with unstructured default OCR", {
+                    "file_path": file_path,
+                    "chunks": len(chunks)
+                })
+                return chunks
+        except Exception as e:
+            log_error("unstructured_ocr_failed", {
+                "file_path": file_path,
+                "error": str(e),
+                "stage": "default_ocr"
+            })
+
+    # Second try: Unstructured with explicit tesseract
+    if _UNSTRUCTURED_AVAILABLE:
+        try:
+            elements = _unstructured_partition(filename=file_path,
+                                               include_page_breaks=False,
+                                               strategy='hi_res',
+                                               ocr_languages=["eng"]) or []
+            for el in elements:
+                text = str(el).strip()
+                if text:
+                    chunks.append(text)
+            if chunks:
+                log_service_event("image_ocr_success", "Successfully extracted text with unstructured tesseract OCR", {
+                    "file_path": file_path,
+                    "chunks": len(chunks)
+                })
+                return chunks
+        except Exception as e:
+            log_error("unstructured_tesseract_failed", {
+                "file_path": file_path,
+                "error": str(e),
+                "stage": "tesseract_mode"
+            })
+
+    # Third try: Direct tesseract if available
     try:
-        return parse_standard_document(file_path, source_url)
-    except HTTPException as e:
-        log_service_event("image_ocr_unavailable", "Image OCR unavailable or failed", {
+        import pytesseract
+        from PIL import Image
+        img = Image.open(file_path)
+        text = pytesseract.image_to_string(img, lang='eng')
+        if text.strip():
+            chunks = [p.strip() for p in text.split('\n\n') if p.strip()]
+            log_service_event("image_ocr_success", "Successfully extracted text with direct tesseract", {
+                "file_path": file_path,
+                "chunks": len(chunks)
+            })
+            return chunks
+    except Exception as e:
+        log_error("direct_tesseract_failed", {
             "file_path": file_path,
-            "source_url": source_url,
-            "detail": str(e)
+            "error": str(e),
+            "stage": "direct_tesseract"
         })
-        return []
+
+    # All methods failed
+    log_service_event("image_ocr_unavailable", "All OCR methods failed", {
+        "file_path": file_path,
+        "source_url": source_url
+    })
+    return []
 
 
 def parse_pdf_file(file_path: str, source_url: str) -> List[str]:
@@ -327,12 +396,11 @@ def parse_pdf_file(file_path: str, source_url: str) -> List[str]:
         return []
 
 
-# --- PPTX Parser using Docling and EasyOCR for images ---
+# --- PPTX Parser using Docling ---
 def parse_pptx_file(file_path: str, source_url: str) -> List[str]:
     """Parse PPTX file and return list of text chunks using Docling.
 
-    If images are detected (shown as <!-- image --> tags), extract them
-    and use EasyOCR to perform OCR on the images for better text extraction.
+    Focuses on extracting text content from slides while noting the presence of images.
     """
     try:
         from docling.document_converter import DocumentConverter
@@ -365,6 +433,10 @@ def parse_pptx_file(file_path: str, source_url: str) -> List[str]:
 
         # Check if markdown contains image placeholders
         contains_images = "<!-- image -->" in markdown_content
+        if contains_images:
+            log_service_event("pptx_images_detected", "Images detected in PPTX (text only extraction)", {
+                "file_path": file_path
+            })
 
         # Split markdown by headings to get slide chunks
         slide_chunks = []
@@ -378,151 +450,23 @@ def parse_pptx_file(file_path: str, source_url: str) -> List[str]:
                     slide_text = '\n\n'.join(current_slide)
                     if not slide_text.startswith('Slide'):
                         slide_text = f"Slide {slide_count}: {current_slide[0]}\n\n" + slide_text
+                    if "<!-- image -->" in slide_text:
+                        slide_text += "\n\n[Image content not extracted]"
                     slide_chunks.append(slide_text)
                     current_slide = []
             if line.strip():
                 current_slide.append(line)
+
         if current_slide:
             slide_count += 1
             slide_text = '\n\n'.join(current_slide)
             if not slide_text.startswith('Slide'):
                 slide_text = f"Slide {slide_count}: {current_slide[0]}\n\n" + slide_text
+            if "<!-- image -->" in slide_text:
+                slide_text += "\n\n[Image content not extracted]"
             slide_chunks.append(slide_text)
 
         chunks = slide_chunks
-
-        # If images were detected, extract them from PPTX and perform OCR
-        if contains_images:
-            try:
-                log_service_event("image_extraction_start", "Images detected in PPTX, extracting with python-pptx", {
-                    "file_path": file_path,
-                })
-
-                # Extract images using python-pptx
-                from pptx import Presentation
-                import tempfile
-                import os
-
-                # Create temp directory for extracted images
-                images_temp_dir = tempfile.mkdtemp(prefix="pptx_images_")
-                prs = Presentation(file_path)
-
-                image_ocr_results = []
-                img_count = 0
-
-                # Extract images from each slide
-                for i, slide in enumerate(prs.slides):
-                    slide_num = i + 1
-                    slide_images = []
-
-                    for shape in slide.shapes:
-                        if shape.shape_type == 13:  # 13 is the enum value for pictures
-                            img_count += 1
-                            try:
-                                # Extract image to temp file
-                                image = shape.image
-                                image_bytes = image.blob
-                                img_ext = image.ext.lower() if hasattr(image, 'ext') else '.png'
-
-                                # Ensure we handle common image extensions correctly
-                                if img_ext not in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']:
-                                    img_ext = '.png'  # Default to PNG for unknown formats
-
-                                img_path = os.path.join(
-                                    images_temp_dir, f"slide_{slide_num}_img_{img_count}{img_ext}")
-
-                                with open(img_path, 'wb') as img_file:
-                                    img_file.write(image_bytes)
-
-                                # Use EasyOCR on the image
-                                try:
-                                    import easyocr
-                                    import numpy as np
-                                    import cv2
-
-                                    # Initialize EasyOCR reader once (lazy loading)
-                                    if 'ocr_reader' not in locals():
-                                        log_service_event(
-                                            "easyocr_init", "Initializing EasyOCR", {})
-                                        ocr_reader = easyocr.Reader(
-                                            ['en'], gpu=False)
-
-                                    # Read image and perform OCR
-                                    try:
-                                        # For JPEG/JPG files, we'll try using PIL first if cv2 fails
-                                        img = cv2.imread(img_path)
-
-                                        if img is None and (img_path.lower().endswith('.jpg') or img_path.lower().endswith('.jpeg')):
-                                            from PIL import Image
-                                            import numpy as np
-                                            pil_img = Image.open(img_path)
-                                            img = np.array(
-                                                pil_img.convert('RGB'))
-                                            # Convert RGB to BGR for OpenCV
-                                            img = img[:, :, ::-1].copy()
-
-                                        if img is not None:
-                                            ocr_results = ocr_reader.readtext(
-                                                img)
-
-                                            if ocr_results:
-                                                # Extract text from OCR results
-                                                texts = [
-                                                    text for _, text, conf in ocr_results if conf > 0.5]
-                                                if texts:
-                                                    ocr_text = " ".join(texts)
-                                                    image_ocr_results.append(
-                                                        f"Slide {slide_num} Image {img_count} OCR: {ocr_text}")
-                                                    log_service_event("easyocr_success", "Successfully extracted text with EasyOCR", {
-                                                        "slide": slide_num,
-                                                        "image": img_count,
-                                                        "format": img_ext,
-                                                        "text_length": len(ocr_text)
-                                                    })
-                                    except Exception as img_read_err:
-                                        log_error("image_read_failed", {
-                                            "file_path": img_path,
-                                            "format": img_ext,
-                                            "error": str(img_read_err)
-                                        })
-                                except Exception as ocr_err:
-                                    log_error("easyocr_failed", {
-                                        "file_path": img_path,
-                                        "slide": slide_num,
-                                        "error": str(ocr_err)
-                                    })
-                            except Exception as img_err:
-                                log_error("image_extraction_failed", {
-                                    "slide": slide_num,
-                                    "error": str(img_err)
-                                })
-
-                # Add OCR results to chunks
-                if image_ocr_results:
-                    for i, ocr_result in enumerate(image_ocr_results):
-                        # Find which slide this image belongs to based on slide number in the OCR result
-                        slide_num = int(ocr_result.split(
-                            "Slide ")[1].split(" ")[0])
-
-                        # Try to find the corresponding slide chunk
-                        for j, chunk in enumerate(chunks):
-                            if chunk.startswith(f"Slide {slide_num}:") or chunk.startswith(f"Slide {slide_num}\n"):
-                                # Append OCR result to the slide content
-                                chunks[j] = chunks[j] + f"\n\n{ocr_result}"
-                                break
-
-                # Clean up temp directory
-                try:
-                    import shutil
-                    shutil.rmtree(images_temp_dir)
-                except Exception:
-                    pass
-
-            except Exception as extract_err:
-                log_error("pptx_image_extraction_failed", {
-                    "file_path": file_path,
-                    "error": str(extract_err)
-                })
 
     except Exception as e:
         log_error("docling_pptx_parse_failed", {
@@ -552,28 +496,26 @@ def parse_pptx_file(file_path: str, source_url: str) -> List[str]:
 
 # Legacy PPTX parser as fallback
 def _legacy_parse_pptx_file(file_path: str, source_url: str) -> List[str]:
-    """Legacy PPTX parser using python-pptx as a fallback if Docling is unavailable."""
+    """Legacy PPTX parser using python-pptx as a fallback if Docling is unavailable.
+    Focuses on text extraction only.
+    """
     try:
         from pptx import Presentation
-        import io
-        import os
-        from PIL import Image
     except ImportError:
         log_error("pptx_import_failed", {
-                  "file_path": file_path, "error": "Required modules not installed (python-pptx, pillow)"})
+                  "file_path": file_path, "error": "Required module not installed (python-pptx)"})
         return []
 
     chunks = []
-    images_temp_dir = None
+    images_found = False
 
     try:
-        # Create temp directory for extracted images
-        images_temp_dir = tempfile.mkdtemp(prefix="pptx_images_")
         prs = Presentation(file_path)
 
         for i, slide in enumerate(prs.slides):
             slide_num = i + 1
             slide_content = [f"Slide {slide_num}"]
+            has_images = False
 
             # Get slide title if available
             title = None
@@ -588,7 +530,10 @@ def _legacy_parse_pptx_file(file_path: str, source_url: str) -> List[str]:
             # Extract text from all text shapes
             text_content = []
             for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text.strip():
+                if shape.shape_type == 13:  # 13 is the enum value for pictures
+                    has_images = True
+                    images_found = True
+                elif hasattr(shape, "text") and shape.text.strip():
                     text_content.append(shape.text.strip())
 
             # Combine all text content
@@ -596,54 +541,9 @@ def _legacy_parse_pptx_file(file_path: str, source_url: str) -> List[str]:
                 slide_content.append("Text Content:")
                 slide_content.append("\n".join(text_content))
 
-            # Extract and process images if available
-            image_content = []
-            img_count = 0
-
-            for shape in slide.shapes:
-                if shape.shape_type == 13:  # 13 is the enum value for pictures
-                    img_count += 1
-                    try:
-                        # Extract image to temp file
-                        image = shape.image
-                        image_bytes = image.blob
-                        img_ext = image.ext.lower() if hasattr(image, 'ext') else '.png'
-                        img_path = os.path.join(
-                            images_temp_dir, f"slide_{slide_num}_img_{img_count}{img_ext}")
-
-                        with open(img_path, 'wb') as img_file:
-                            img_file.write(image_bytes)
-
-                        # Use OCR on the image if unstructured is available
-                        if _UNSTRUCTURED_AVAILABLE:
-                            img_text = []
-                            try:
-                                elements = _unstructured_partition(
-                                    filename=img_path) or []
-                                for el in elements:
-                                    text = str(el).strip()
-                                    if text:
-                                        img_text.append(text)
-                            except Exception as ocr_err:
-                                log_error("image_ocr_failed", {
-                                    "file_path": img_path,
-                                    "slide": slide_num,
-                                    "error": str(ocr_err)
-                                })
-
-                            if img_text:
-                                image_content.append(
-                                    f"Image {img_count} content: {' '.join(img_text)}")
-                    except Exception as img_err:
-                        log_error("image_extraction_failed", {
-                            "slide": slide_num,
-                            "error": str(img_err)
-                        })
-
-            # Add image content if available
-            if image_content:
-                slide_content.append("\nImage Content:")
-                slide_content.extend(image_content)
+            # Note presence of images
+            if has_images:
+                slide_content.append("\n[Slide contains image content]")
 
             # Add this slide's content as a chunk
             if len(slide_content) > 1:  # More than just the slide header
@@ -653,21 +553,16 @@ def _legacy_parse_pptx_file(file_path: str, source_url: str) -> List[str]:
         log_error("pptx_parse_failed", {
                   "file_path": file_path, "error": str(e)})
         return []
-    finally:
-        # Clean up temp directory
-        if images_temp_dir and os.path.exists(images_temp_dir):
-            try:
-                import shutil
-                shutil.rmtree(images_temp_dir)
-            except Exception:
-                pass
 
+    # Log parsing results
     log_service_event("pptx_parsed_legacy", "Parsed PPTX file with legacy parser", {
         "file_path": file_path,
         "source_url": source_url,
         "slides_processed": len(prs.slides) if 'prs' in locals() else 0,
+        "contains_images": images_found,
         "chunks": len(chunks)
     })
+
     return chunks
 
 
