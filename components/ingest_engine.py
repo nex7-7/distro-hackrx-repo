@@ -363,19 +363,13 @@ def parse_pptx_file(file_path: str, source_url: str) -> List[str]:
         # Get markdown representation
         markdown_content = document.export_to_markdown()
 
-        # Process by slide (based on headings in markdown)
+        # Split markdown by headings to get slide chunks
         slide_chunks = []
         current_slide = []
         slide_count = 0
-
-        # Split the markdown content by lines for processing
         lines = markdown_content.split('\n')
-        in_slide = False
-
         for line in lines:
-            # Detect slide headers (typically headings in the markdown)
             if line.startswith('# ') or line.startswith('## '):
-                # If we already collected content for a slide, save it
                 if current_slide:
                     slide_count += 1
                     slide_text = '\n\n'.join(current_slide)
@@ -383,36 +377,14 @@ def parse_pptx_file(file_path: str, source_url: str) -> List[str]:
                         slide_text = f"Slide {slide_count}: {current_slide[0]}\n\n" + slide_text
                     slide_chunks.append(slide_text)
                     current_slide = []
-                in_slide = True
-
-            # If we're inside a slide, collect the content
-            if in_slide and line.strip():
+            if line.strip():
                 current_slide.append(line)
-
-        # Don't forget the last slide
         if current_slide:
             slide_count += 1
             slide_text = '\n\n'.join(current_slide)
             if not slide_text.startswith('Slide'):
                 slide_text = f"Slide {slide_count}: {current_slide[0]}\n\n" + slide_text
             slide_chunks.append(slide_text)
-
-        # Extract any tables and add them separately
-        tables = document.export_tables()
-        for i, table in enumerate(tables):
-            if table and isinstance(table, str) and len(table.strip()) > 50:
-                slide_chunks.append(f"Slide Table {i+1}:\n\n{table}")
-
-        # Extract any figures/images content
-        try:
-            figures = document.export_figures()
-            for i, figure in enumerate(figures):
-                if figure and hasattr(figure, 'alt_text') and figure.alt_text:
-                    slide_chunks.append(
-                        f"Slide Image {i+1}:\n\nImage Content: {figure.alt_text}")
-        except Exception as fig_err:
-            log_error("docling_figure_extraction_failed",
-                      {"error": str(fig_err)})
 
         chunks = slide_chunks
 
