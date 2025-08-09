@@ -34,7 +34,7 @@ from logger import (
 
 # Import components
 from components.retrieval import fetch_and_parse_pdf
-from components.chunking import clean_and_rechunk_texts
+from components.chunking import semantic_chunk_texts
 from components.embeddings import create_embeddings, create_query_embedding
 from components.weaviate_db import connect_to_weaviate, ingest_to_weaviate
 from components.search import hybrid_search
@@ -380,9 +380,16 @@ async def process_document_and_answer_questions(
             chunks = await fetch_and_parse_pdf(PARSING_API_URL, document_url)
             print(f"📝 Extracted {len(chunks)} initial text chunks.")
 
-            # 2. Clean and rechunk texts
-            chunks = clean_and_rechunk_texts(chunks)
-            print(f"🧩 After rechunking: {len(chunks)} chunks.")
+            # 2. Semantic chunking
+            chunks = semantic_chunk_texts(
+                chunks,
+                embedding_model=ml_models['embedding_model'],
+                model_name=MODEL_NAME,
+                similarity_threshold=0.8,  # You can tune this value
+                min_chunk_size=3,
+                max_chunk_size=12
+            )
+            print(f"🧩 After semantic chunking: {len(chunks)} chunks.")
 
             # 3. Use global Weaviate client or connect if not available
             global weaviate_client
