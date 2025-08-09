@@ -10,7 +10,7 @@ from typing import List
 from nltk.tokenize import word_tokenize
 
 # Import local modules
-from logger import log_service_event
+from components.utils.logger import log_service_event
 
 
 def semantic_chunk_texts(
@@ -37,7 +37,7 @@ def semantic_chunk_texts(
     """
     import numpy as np
     from nltk.tokenize import sent_tokenize
-    from logger import log_service_event
+    from components.utils.logger import log_service_event
     import uuid
     import time
 

@@ -10,7 +10,7 @@ import weaviate
 from weaviate.exceptions import WeaviateClosedClientError
 
 # Import local modules
-from logger import log_service_event
+from components.utils.logger import log_service_event
 
 
 def hybrid_search(

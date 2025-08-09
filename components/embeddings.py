@@ -9,7 +9,7 @@ from typing import List, Dict, Any
 from datetime import datetime
 
 # Import local modules
-from logger import log_service_event
+from components.utils.logger import log_service_event
 
 
 def create_embeddings(chunks: List[str], model, model_name: str) -> Any:

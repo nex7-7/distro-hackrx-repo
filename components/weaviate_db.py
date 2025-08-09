@@ -14,7 +14,7 @@ from tqdm import tqdm
 from datetime import datetime
 
 # Import local modules
-from logger import log_service_event, log_error
+from components.utils.logger import log_service_event, log_error
 
 
 async def connect_to_weaviate(host: str, port: int, grpc_port: int) -> weaviate.WeaviateClient:

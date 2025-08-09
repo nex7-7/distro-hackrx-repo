@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Body, Header, Depends, Security, HTT
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 # Import custom logger module
-from logger import (
+from components.utils.logger import (
     logger,
     setup_file_logging,
     log_api_request,
@@ -33,13 +33,18 @@ from logger import (
 )
 
 # Import components
-from components.retrieval import fetch_and_parse_pdf
+# legacy (kept for compatibility)
+from components.ingest_engine import ingest_from_url
 from components.chunking import semantic_chunk_texts
 from components.embeddings import create_embeddings, create_query_embedding
 from components.weaviate_db import connect_to_weaviate, ingest_to_weaviate
 from components.search import hybrid_search
 from components.prompt_template import create_prompt
-from components.gemini_api import generate_gemini_response_httpx
+from components.gemini_api import (
+    generate_gemini_response_httpx,
+    generate_mistral_response_httpx,
+    generate_github_models_response_httpx
+)
 from components.reranker_utils import diagnose_reranker_model
 
 # Initialize NLTK
@@ -104,25 +109,7 @@ async def lifespan(app: FastAPI):
     print("✅ Embedding model loaded.")
     log_service_event("model_loaded", f"Embedding model loaded: {MODEL_NAME}")
 
-    print(f"🤖 Loading reranker model '{RERANKER_MODEL_NAME}'...")
-    try:
-        log_service_event(
-            "model_loading", f"Loading reranker model: {RERANKER_MODEL_NAME}")
-        ml_models['reranker_model'] = CrossEncoder(
-            RERANKER_MODEL_NAME, device='cpu', cache_folder=CACHE_DIR)
-        print("✅ Reranker model loaded.")
-        log_service_event(
-            "model_loaded", f"Reranker model loaded: {RERANKER_MODEL_NAME}")
-
-        # Diagnose the reranker model
-        diagnose_reranker_model(ml_models['reranker_model'])
-    except Exception as e:
-        log_error("reranker_load_failed", {
-            "model": RERANKER_MODEL_NAME,
-            "error": str(e)
-        })
-        print(f"⚠️ Failed to load reranker model: {e}")
-        print("⚠️ Continuing without reranking capability.")
+    # Reranker model loading removed (not used in pipeline)
 
     # Connect to Weaviate once during startup
     global weaviate_client
@@ -182,8 +169,8 @@ router = APIRouter(prefix="/api/v1")
 
 security = HTTPBearer()
 
-# --- Pydantic Models ---
 
+# --- Pydantic Models ---
 
 class QueryRequest(BaseModel):
     documents: str = Field(..., example="https://some-url.com/document.pdf")
@@ -197,8 +184,20 @@ class Answer(BaseModel):
 
 class QueryResponse(BaseModel):
     answers: List[str]
-    # results: List[Answer] = None
-    # processing_time_seconds: float = None
+
+
+class LLMTestRequest(BaseModel):
+    prompt: str = Field(..., example="What is the capital of France?")
+    questions: List[str] = Field(default_factory=list, example=[
+                                 "What is the capital of France?"])
+
+
+class LLMTestResponse(BaseModel):
+    response: str
+
+
+class ClearWeaviateResponse(BaseModel):
+    message: str
 
 # --- Authentication Function ---
 
@@ -321,8 +320,8 @@ async def process_single_question(
     })
     return Answer(question=question, answer=answer_text)
 
-# --- API Endpoints ---
 
+# --- API Endpoints ---
 
 @router.post("/hackrx/run", response_model=QueryResponse, tags=["RAG Pipeline"])
 async def process_document_and_answer_questions(
@@ -376,9 +375,9 @@ async def process_document_and_answer_questions(
 
         # Create HTTP client session for making requests
         async with httpx.AsyncClient() as http_client:
-            # 1. Fetch and parse document
-            chunks = await fetch_and_parse_pdf(PARSING_API_URL, document_url)
-            print(f"📝 Extracted {len(chunks)} initial text chunks.")
+            # 1. Ingest document (new engine) -> list[str] chunks
+            chunks = ingest_from_url(document_url)
+            print(f"📝 Ingested {len(chunks)} initial text chunks.")
 
             # 2. Semantic chunking
             chunks = semantic_chunk_texts(
@@ -465,6 +464,58 @@ async def process_document_and_answer_questions(
 
         # Re-raise the exception to return appropriate error response
         raise
+
+
+@router.post("/github-models", response_model=LLMTestResponse, tags=["LLM Testing"])
+async def test_github_models_api(request: LLMTestRequest):
+    """
+    Test the GitHub Models API directly with a prompt and optional questions.
+    """
+    async with httpx.AsyncClient() as http_client:
+        prompt = request.prompt
+        response = await generate_github_models_response_httpx(http_client, prompt)
+        return LLMTestResponse(response=response)
+
+
+@router.post("/gemini", response_model=LLMTestResponse, tags=["LLM Testing"])
+async def test_gemini_api(request: LLMTestRequest):
+    """
+    Test the Gemini API directly with a prompt and optional questions.
+    """
+    async with httpx.AsyncClient() as http_client:
+        prompt = request.prompt
+        response = await generate_gemini_response_httpx(http_client, prompt)
+        return LLMTestResponse(response=response)
+
+
+@router.post("/mistral", response_model=LLMTestResponse, tags=["LLM Testing"])
+async def test_mistral_api(request: LLMTestRequest):
+    """
+    Test the Mistral API directly with a prompt and optional questions.
+    """
+    async with httpx.AsyncClient() as http_client:
+        prompt = request.prompt
+        response = await generate_mistral_response_httpx(http_client, prompt)
+        return LLMTestResponse(response=response)
+
+
+@router.post("/clear-weaviate", response_model=ClearWeaviateResponse, tags=["Weaviate Admin"])
+async def clear_weaviate_collections():
+    """
+    Delete all collections in Weaviate (admin operation).
+    """
+    try:
+        import weaviate
+        client = await connect_to_weaviate(WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_GRPC_PORT)
+        schema = client.collections.list_all()
+        for collection in schema:
+            client.collections.delete(collection)
+        client.close()
+        return ClearWeaviateResponse(message="All collections deleted. Weaviate is now empty.")
+    except Exception as e:
+        log_error("clear_weaviate_error", {"error": str(e)})
+        raise HTTPException(
+            status_code=500, detail=f"Failed to clear Weaviate: {e}")
 
 # Include the router in the main app
 app.include_router(router)

@@ -15,7 +15,13 @@ from urllib.parse import urlparse, unquote
 from fastapi import HTTPException
 
 # Import local modules
-from logger import logger, log_service_event, log_error
+from components.utils.logger import logger, log_service_event, log_error
+# new engine, pdf parser
+from components.ingest_engine import ingest_from_url, Parser_Registry, parse_pdf_file
+
+# NOTE: Existing functions (fetch_and_parse_pdf / extract_and_process_zip) retained for backward
+# compatibility. New ingestion engine `ingest_from_url` can be adopted by replacing calls where
+# appropriate. It returns List[str] just like fetch_and_parse_pdf.
 
 
 async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
@@ -23,16 +29,11 @@ async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
     Downloads and processes document files for text extraction.
 
     Supported formats:
-    - PDF (.pdf) - processed with PyMuPDF as primary, extract_unstructured as fallback
-    - Word Documents (.docx, .doc) - processed with extract_unstructured
-    - Text Files (.txt) - processed with extract_unstructured
-    - Markdown Files (.md) - processed with extract_unstructured
-    - Rich Text Format (.rtf) - processed with extract_unstructured
+    - (Legacy) PDF/.docx/.txt/etc. Previously routed through external parser; now superseded by ingest_engine.
     - ZIP archives containing any of the above formats
 
     For PDF files, PyMuPDF is used as the primary parser for better performance and accuracy.
-    If PyMuPDF fails, extract_unstructured is used as a fallback.
-    For non-PDF files, extract_unstructured is used directly.
+    Legacy behaviour retained for backward compatibility; prefer ingest_engine.ingest_from_url.
     If the file is a ZIP archive, extracts it and processes all supported documents inside.
 
     Parameters:
@@ -126,45 +127,31 @@ async def fetch_and_parse_pdf(api_url: str, file_url: str) -> List[str]:
         })
 
     if file_extension == ".pdf":
+        # Use inlined ingestion engine PyMuPDF parser (expects file path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file_response.content)
+            temp_path = tmp.name
         try:
-            from components.parsing import parse_pdf_with_pymupdf
-            return parse_pdf_with_pymupdf(file_response.content, document_id, filename)
-        except Exception as e:
-            error_msg = f"PDF parsing failed with both methods: {e}"
-            log_error("pdf_parsing_failed", {
-                "document_id": document_id,
-                "filename": filename,
-                "error": str(e)
-            })
-            raise HTTPException(status_code=422, detail=error_msg)
+            return parse_pdf_file(temp_path, file_url)
+        finally:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
     else:
-        # For non-PDF files, use extract_unstructured directly
-        try:
-            from extract_unstructured import extract_text_from_file
-            return extract_text_from_file(file_response.content, content_type, document_id, filename)
-        except Exception as e:
-            error_msg = f"Failed to extract text from file: {e}"
-            log_error("non_pdf_extraction_failed", {
-                "document_id": document_id,
-                "filename": filename,
-                "extension": file_extension,
-                "error": str(e)
-            })
-            raise HTTPException(status_code=422, detail=error_msg)
+        # Minimal legacy stub: return raw text blob as single chunk
+        text = file_response.content.decode('utf-8', errors='ignore')
+        return [t for t in text.split('\n\n') if t.strip()]
 
 
 async def extract_and_process_zip(api_url: str, zip_content: bytes, original_filename: str) -> List[str]:
     """
     Extracts a ZIP file and processes any supported document files found inside.
 
-    Supported formats include: PDF, DOCX, DOC, TXT, MD, RTF
-
+    return parse_pdf_file(file_response.content, document_id, filename)
     For PDF files within the ZIP:
     - Primary: PyMuPDF for better performance and accuracy
-    - Fallback: extract_unstructured if PyMuPDF fails
-
-    For non-PDF files within the ZIP:
-    - Uses extract_unstructured directly
+    (Legacy note: earlier versions used external extract_unstructured fallback.)
 
     Parameters:
         api_url (str): URL of the parsing API (legacy parameter, no longer used).
@@ -236,39 +223,22 @@ async def extract_and_process_zip(api_url: str, zip_content: bytes, original_fil
 
                     # Process based on file type
                     if file_extension == '.pdf':
-                        from components.parsing import parse_pdf_with_pymupdf
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                            tmp_pdf.write(file_content)
+                            pdf_path = tmp_pdf.name
                         try:
-                            chunks = parse_pdf_with_pymupdf(
-                                file_content, doc_id, doc_filename)
+                            chunks = parse_pdf_file(
+                                pdf_path, original_filename)
                             combined_chunks.extend(chunks)
-                        except Exception as e:
-                            # Fallback to extract_unstructured for PDF
-                            log_service_event("pdf_parse_fallback", f"Falling back to extract_unstructured for PDF", {
-                                "zip_id": zip_id,
-                                "doc_id": doc_id,
-                                "filename": doc_filename,
-                                "error": str(e)
-                            })
-                            from extract_unstructured import extract_text_from_file
-                            chunks = extract_text_from_file(
-                                file_content, 'application/pdf', doc_id, doc_filename)
-                            combined_chunks.extend(chunks)
+                        finally:
+                            try:
+                                os.unlink(pdf_path)
+                            except OSError:
+                                pass
                     else:
-                        # For non-PDF files, use extract_unstructured
-                        content_type_map = {
-                            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                            '.doc': 'application/msword',
-                            '.txt': 'text/plain',
-                            '.md': 'text/markdown',
-                            '.rtf': 'application/rtf'
-                        }
-                        content_type = content_type_map.get(
-                            file_extension, 'application/octet-stream')
-
-                        from extract_unstructured import extract_text_from_file
-                        chunks = extract_text_from_file(
-                            file_content, content_type, doc_id, doc_filename)
-                        combined_chunks.extend(chunks)
+                        text = file_content.decode('utf-8', errors='ignore')
+                        parts = [p for p in text.split('\n\n') if p.strip()]
+                        combined_chunks.extend(parts)
 
                     log_service_event("zip_file_processed", f"Processed file from ZIP", {
                         "zip_id": zip_id,
