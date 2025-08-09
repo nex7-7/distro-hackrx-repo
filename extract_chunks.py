@@ -58,7 +58,7 @@ def process_document(doc_path: str, chunk_size: int = 500):
 
 if __name__ == "__main__":
     # Example usage for a single document (any supported type)
-    doc_path = "/Users/aayushshah/Programming/hackrx-repo/40-kWp-Technical-Bid-ZO-1.docx"
+    doc_path = "data/40-kWp-Technical-Bid-ZO-1.docx"
     output_file = os.path.splitext(os.path.basename(doc_path))[0] + "_chunks.json"
     chunks = process_document(doc_path, chunk_size=500)
     print(f"Extracted {len(chunks)} chunks from {os.path.basename(doc_path)}")
