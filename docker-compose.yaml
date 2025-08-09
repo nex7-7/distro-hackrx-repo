@@ -1,11 +1,5 @@
 version: '3.8'
 services:
-  llmsherpa:
-    image: ghcr.io/nlmatics/nlm-ingestor:latest
-    ports:
-      - "5010:5001"
-    restart: always
-
   weaviate:
     command:
     - --host
