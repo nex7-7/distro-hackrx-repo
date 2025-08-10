@@ -128,7 +128,7 @@ async def solve_riddle(http_client: httpx.AsyncClient) -> str:
     if not flight_number:
         raise ValueError("Flight number not present in flight endpoint response")
     # Wait for 4 seconds before sending the response (per user request)
-    await asyncio.sleep(2)
+    await asyncio.sleep(4.22)
     return f"The flight number is {flight_number}"
 
 __all__ = ["solve_riddle", "CITY_TO_LANDMARK"]
