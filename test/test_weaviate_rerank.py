@@ -32,7 +32,7 @@ from components.weaviate_db import connect_to_weaviate, ingest_to_weaviate
 load_dotenv()
 
 # Configuration
-WEAVIATE_HOST = os.getenv("WEAVIATE_HOST", "127.0.0.1")
+WEAVIATE_HOST = os.getenv("WEAVIATE_HOST", "weaviate")
 WEAVIATE_PORT = int(os.getenv("WEAVIATE_PORT", 8080))
 WEAVIATE_GRPC_PORT = int(os.getenv("WEAVIATE_GRPC_PORT", 50051))
 EMBEDDING_MODEL_NAME = 'BAAI/bge-base-en-v1.5'

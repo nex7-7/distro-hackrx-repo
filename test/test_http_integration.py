@@ -6,7 +6,7 @@ during its reasoning process. Run this to test the integration.
 """
 import asyncio
 import httpx
-from components.riddle_solver import solve_riddle_with_query
+from components.agentic_solver import solve_riddle_with_query
 
 
 async def test_http_integration():

@@ -8,7 +8,7 @@ services:
       - .:/app
       - ./huggingface_cache:/app/huggingface_cache
     environment:
-      - WEAVIATE_HOST=weaviate
+      - w=weaviate
       - WEAVIATE_PORT=8080
       - WEAVIATE_GRPC_PORT=50051
       - PYTHONPATH=/app
@@ -16,6 +16,8 @@ services:
       - weaviate
     restart: unless-stopped
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    networks:
+      - hackrx-net
 
   weaviate:
     command:
@@ -40,5 +42,12 @@ services:
       CLUSTER_HOSTNAME: 'disable'       # Prevent accidental clustering
       CLUSTER_GOSSIP_BIND_PORT: '0'     # Disable gossip port
       CLUSTER_DATA_BIND_PORT: '0'       # Disable RAFT port
+    networks:
+      - hackrx-net
+
 volumes:
   weaviate_data:
+
+networks:
+  hackrx-net:
+    driver: bridge

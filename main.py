@@ -45,16 +45,14 @@ from components.gemini_api import (
     generate_github_models_response_httpx
 )
 from components.reranker_utils import diagnose_reranker_model
-from components.riddle_solver import solve_riddle, solve_riddle_with_query
+from components.agentic_solver import solve_riddle, solve_riddle_with_query
 
-nltk.data.find('tokenizers/punkt')
-nltk.download('punkt_tab')
-nltk.download('punk')
+nltk.download('punkt')
 
 
 # Load environment variables
 load_dotenv()
-WEAVIATE_HOST = os.getenv("WEAVIATE_HOST", "127.0.0.1")
+WEAVIATE_HOST = os.getenv("WEAVIATE_HOST", "weaviate")
 WEAVIATE_PORT = int(os.getenv("WEAVIATE_PORT", 8080))
 WEAVIATE_GRPC_PORT = int(os.getenv("WEAVIATE_GRPC_PORT", 50051))
 AUTH_TOKEN = os.getenv(
@@ -84,8 +82,6 @@ if not GEMINI_API_KEY_LIST:
 
 # Set API URLs
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_NAME}:generateContent"
-PARSING_API_URL = os.getenv(
-    "PARSING_API_URL", "http://127.0.0.1:5010/api/parseDocument?renderFormat=all")
 
 # Load reranker model name
 RERANKER_MODEL_NAME = os.getenv(

@@ -1,7 +1,7 @@
 import weaviate
 
 # Connect to local Weaviate instance
-client = weaviate.connect_to_local(host="127.0.0.1", port=8080)
+client = weaviate.connect_to_local(host="weaviate", port=8080)
 
 # Get schema object
 schema = client.collections.list_all()
