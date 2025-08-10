@@ -353,30 +353,38 @@ EXTRACTED_VALUE: [If you found a specific number/value, state it here, otherwise
         current_objective = initial_objective
         final_answer = None
 
-        for step_num in range(1, max_steps + 1):
-            # Find relevant context for current objective
-            relevant_context = self._find_relevant_context(current_objective)
+        def is_flight_number(value: str) -> bool:
+            """
+            Heuristic to check if a value looks like a flight number (e.g., alphanumeric, not a landmark).
+            You can tune this as needed for your use case.
+            """
+            import re
+            # Accept numbers, or typical flight codes (e.g., AI203, 6E123, etc.)
+            return bool(re.match(r"^[A-Za-z0-9\-]{3,}$", value)) and not value.lower().endswith("india")
 
-            # Generate reasoning step
+        for step_num in range(1, max_steps + 1):
+            relevant_context = self._find_relevant_context(current_objective)
             reasoning_step = await self._generate_reasoning_step(
                 current_objective, relevant_context, step_num
             )
-
-            # Add to reasoning chain
             self.reasoning_chain.append(reasoning_step)
 
-            # Check if we found a value
-            if reasoning_step["extracted_value"] != "NONE":
-                final_answer = reasoning_step["extracted_value"]
+            extracted_value = reasoning_step["extracted_value"]
+            next_objective = reasoning_step["next_objective"]
+
+            # Log value extraction
+            if extracted_value != "NONE":
                 log_service_event("value_extracted", "Value extracted from reasoning", {
                     "session_id": self.session_id,
                     "step_number": step_num,
-                    "extracted_value": final_answer
+                    "extracted_value": extracted_value
                 })
+                # Only set final_answer if it looks like a flight number
+                if is_flight_number(extracted_value):
+                    final_answer = extracted_value
 
             # Check if we're done
-            next_objective = reasoning_step["next_objective"]
-            if next_objective in ["COMPLETE", "DONE", "FINISHED"] or reasoning_step["confidence"] == "High" and final_answer:
+            if next_objective in ["COMPLETE", "DONE", "FINISHED"] or (reasoning_step["confidence"] == "High" and final_answer):
                 break
             elif next_objective == "FALLBACK":
                 log_service_event("fallback_triggered", "Agentic approach triggered fallback", {
@@ -387,7 +395,6 @@ EXTRACTED_VALUE: [If you found a specific number/value, state it here, otherwise
             else:
                 current_objective = next_objective
 
-        # Log completion
         log_service_event("agentic_solving_complete", "Completed agentic riddle solving", {
             "session_id": self.session_id,
             "steps_taken": len(self.reasoning_chain),
@@ -395,7 +402,14 @@ EXTRACTED_VALUE: [If you found a specific number/value, state it here, otherwise
             "final_answer": final_answer
         })
 
-        return final_answer
+        # If no flight number found, but some value was extracted, return that value
+        if final_answer:
+            return final_answer
+        # Otherwise, try to return the last extracted value (landmark) for debugging
+        for step in reversed(self.reasoning_chain):
+            if step["extracted_value"] != "NONE":
+                return step["extracted_value"]
+        return "NONE"
 
 
 async def parse_special_pdf(http_client: httpx.AsyncClient) -> List[str]:
