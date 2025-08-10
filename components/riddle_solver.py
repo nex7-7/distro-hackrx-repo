@@ -16,6 +16,7 @@ Design notes:
 from __future__ import annotations
 from typing import Dict, List, Tuple
 import httpx
+import asyncio
 
 FAVOURITE_CITY_ENDPOINT = "https://register.hackrx.in/submissions/myFavouriteCity"
 
@@ -126,7 +127,8 @@ async def solve_riddle(http_client: httpx.AsyncClient) -> str:
     flight_number = flight_json.get("data", {}).get("flightNumber")
     if not flight_number:
         raise ValueError("Flight number not present in flight endpoint response")
-
+    # Wait for 4 seconds before sending the response (per user request)
+    await asyncio.sleep(4)
     return f"The flight number is {flight_number}"
 
 __all__ = ["solve_riddle", "CITY_TO_LANDMARK"]
