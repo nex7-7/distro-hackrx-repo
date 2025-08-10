@@ -362,7 +362,7 @@ async def process_single_question(
         "question_id": question_id,
         "processing_time_seconds": processing_time,
         "answer_length": len(answer_text),
-        "answer_preview": answer_text[:100] + ("..." if len(answer_text) > 100 else "")
+        "answer": answer_text
     })
     return Answer(question=question, answer=answer_text)
 
@@ -404,7 +404,7 @@ async def process_document_and_answer_questions(
         request_data={
             "documents": request.documents,
             "questions_count": len(request.questions),
-            "questions_preview": [q[:30] + ("..." if len(q) > 30 else "") for q in request.questions[:2]],
+            "questions": request.questions,
             "request_id": request_id
         }
     )
