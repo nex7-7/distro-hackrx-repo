@@ -12,12 +12,13 @@ import httpx
 import weaviate
 import weaviate.exceptions
 import uvicorn
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from tqdm import tqdm
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Body, Header, Depends, Security, HTTPException, APIRouter
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -33,7 +34,7 @@ from components.utils.logger import (
 
 # Import components
 # legacy (kept for compatibility)
-from components.ingest_engine import ingest_from_url
+from components.ingest_engine import ingest_from_url, download_and_check_file
 from components.chunking import semantic_chunk_texts
 from components.embeddings import create_embeddings, create_query_embedding
 from components.weaviate_db import connect_to_weaviate, ingest_to_weaviate
@@ -46,6 +47,14 @@ from components.gemini_api import (
 )
 from components.reranker_utils import diagnose_reranker_model
 from components.riddle_solver import solve_riddle
+from components.document_cache import (
+    generate_file_hash,
+    create_collection_name_from_hash,
+    find_cached_document,
+    create_cached_collection,
+    get_cached_document_stats,
+    process_document_with_cache
+)
 
 nltk.data.find('tokenizers/punkt')
 nltk.download('punkt_tab')
@@ -212,7 +221,21 @@ class LLMTestResponse(BaseModel):
 class ClearWeaviateResponse(BaseModel):
     message: str
 
+
+class CacheStatsResponse(BaseModel):
+    unique_documents: int
+    total_chunks: int
+    oldest_cache: Optional[str]
+    newest_cache: Optional[str]
+    cache_collections: List[str]
+
 # --- Authentication Function ---
+
+
+def _is_url(path_or_url: str) -> bool:
+    """Check if a string is a URL."""
+    parsed = urlparse(path_or_url)
+    return bool(parsed.scheme and parsed.netloc)
 
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
@@ -449,19 +472,18 @@ async def process_document_and_answer_questions(
                     duration=processing_time
                 )
                 return QueryResponse(answers=answers)
-            # 1. Ingest document (new engine) -> list[str] chunks
+            # 1. Download and check file security first
             try:
-                chunks = ingest_from_url(document_url)
-                print(f"📝 Ingested {len(chunks)} initial text chunks.")
+                file_path, original_source_url, is_temp_file = download_and_check_file(document_url)
             except HTTPException as he:
-                # Handle security violations and file processing errors
-                log_error("document_ingestion_failed", {
+                # Handle security violations and download errors
+                log_error("file_download_failed", {
                     "document_url": document_url,
                     "request_id": request_id,
                     "status_code": he.status_code,
                     "detail": he.detail
                 })
-                print(f"❌ Document ingestion failed: {he.detail}")
+                print(f"❌ File download/check failed: {he.detail}")
                 
                 # Return "Files Not found" for security violations or processing errors
                 answers = ["Incorrect file type submitted"] * len(questions)
@@ -474,108 +496,173 @@ async def process_document_and_answer_questions(
                         "processing_time": processing_time,
                         "request_id": request_id,
                         "status_code": 200,
-                        "ingestion_failed": True,
+                        "download_failed": True,
                         "failure_reason": he.detail
                     },
                     duration=processing_time
                 )
                 
                 return QueryResponse(answers=answers)
-
-            # Check if any valid content was found
-            if not chunks:
-                log_service_event("no_content_found", "No valid content found in document", {
-                    "document_url": document_url,
-                    "request_id": request_id
-                })
-                print("❌ No valid content found in the document.")
+            
+            # Handle webpages separately (can't be cached by file hash)
+            if file_path == original_source_url and _is_url(file_path):
+                print(f"🌐 Processing webpage: {file_path}")
                 
-                # Return "Files Not found" for all questions
-                answers = ["Files Not found"] * len(questions)
-                
-                processing_time = time.time() - start_time
-                log_api_response(
-                    endpoint="/api/v1/hackrx/run",
-                    response_data={
-                        "answers_count": len(answers),
-                        "processing_time": processing_time,
-                        "request_id": request_id,
-                        "status_code": 200,
-                        "no_content_found": True
-                    },
-                    duration=processing_time
-                )
-                
-                return QueryResponse(answers=answers)
-
-            # 2. Semantic chunking
-            chunks = semantic_chunk_texts(
-                chunks,
-                embedding_model=ml_models['embedding_model'],
-                model_name=MODEL_NAME,
-                similarity_threshold=0.8,  # You can tune this value
-                min_chunk_size=3,
-                max_chunk_size=12
-            )
-            print(f"🧩 After semantic chunking: {len(chunks)} chunks.")
-
-            # Check again after semantic chunking
-            if not chunks:
-                log_service_event("no_content_after_chunking", "No valid content after semantic chunking", {
-                    "document_url": document_url,
-                    "request_id": request_id
-                })
-                print("❌ No valid content found after semantic chunking.")
-                
-                # Return "Files Not found" for all questions
-                answers = ["Files Not found"] * len(questions)
-                
-                processing_time = time.time() - start_time
-                log_api_response(
-                    endpoint="/api/v1/hackrx/run",
-                    response_data={
-                        "answers_count": len(answers),
-                        "processing_time": processing_time,
-                        "request_id": request_id,
-                        "status_code": 200,
-                        "no_content_after_chunking": True
-                    },
-                    duration=processing_time
-                )
-                
-                return QueryResponse(answers=answers)
-
-            # 3. Use global Weaviate client or connect if not available
-            global weaviate_client
-            if weaviate_client is None:
-                weaviate_client = await connect_to_weaviate(WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_GRPC_PORT)
-            else:
-                # Check if the client is still connected
                 try:
-                    weaviate_client.is_ready()
-                except weaviate.exceptions.WeaviateClosedClientError:
-                    # Reconnect if the client is closed
-                    log_service_event(
-                        "weaviate_reconnection", "Reconnecting to Weaviate - client was closed")
+                    chunks, _ = ingest_from_url(file_path)
+                    print(f"📝 Extracted {len(chunks)} chunks from webpage.")
+                    
+                    if not chunks:
+                        answers = ["Files Not found"] * len(questions)
+                        processing_time = time.time() - start_time
+                        log_api_response(
+                            endpoint="/api/v1/hackrx/run",
+                            response_data={
+                                "answers_count": len(answers),
+                                "processing_time": processing_time,
+                                "request_id": request_id,
+                                "status_code": 200,
+                                "webpage_no_content": True
+                            },
+                            duration=processing_time
+                        )
+                        return QueryResponse(answers=answers)
+                    
+                    # For webpages, process without caching
+                    chunks = semantic_chunk_texts(
+                        chunks,
+                        embedding_model=ml_models['embedding_model'],
+                        model_name=MODEL_NAME,
+                        similarity_threshold=0.8,
+                        min_chunk_size=3,
+                        max_chunk_size=12
+                    )
+                    
+                    if not chunks:
+                        answers = ["Files Not found"] * len(questions)
+                        processing_time = time.time() - start_time
+                        log_api_response(
+                            endpoint="/api/v1/hackrx/run",
+                            response_data={
+                                "answers_count": len(answers),
+                                "processing_time": processing_time,
+                                "request_id": request_id,
+                                "status_code": 200,
+                                "webpage_no_content_after_chunking": True
+                            },
+                            duration=processing_time
+                        )
+                        return QueryResponse(answers=answers)
+                    
+                    # Create temporary collection for webpage (no caching)
+                    embeddings = create_embeddings(chunks, ml_models['embedding_model'], MODEL_NAME)
+                    collection_name = f"Webpage_{request_id.replace('-', '')[:12]}"
+                    
+                    # Use global Weaviate client
+                    global weaviate_client
+                    if weaviate_client is None:
+                        weaviate_client = await connect_to_weaviate(WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_GRPC_PORT)
+                    else:
+                        try:
+                            weaviate_client.is_ready()
+                        except weaviate.exceptions.WeaviateClosedClientError:
+                            weaviate_client = await connect_to_weaviate(WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_GRPC_PORT)
+                    
+                    # Store in temporary collection (will be cleared later if needed)
+                    weaviate_client = await ingest_to_weaviate(
+                        weaviate_client,
+                        collection_name,
+                        chunks,
+                        embeddings,
+                        host=WEAVIATE_HOST,
+                        port=WEAVIATE_PORT,
+                        grpc_port=WEAVIATE_GRPC_PORT
+                    )
+                    
+                    was_cached = False
+                    
+                except Exception as e:
+                    log_error("webpage_processing_failed", {
+                        "url": file_path,
+                        "error": str(e)
+                    })
+                    answers = ["Files Not found"] * len(questions)
+                    processing_time = time.time() - start_time
+                    log_api_response(
+                        endpoint="/api/v1/hackrx/run",
+                        response_data={
+                            "answers_count": len(answers),
+                            "processing_time": processing_time,
+                            "request_id": request_id,
+                            "status_code": 200,
+                            "webpage_processing_failed": True
+                        },
+                        duration=processing_time
+                    )
+                    return QueryResponse(answers=answers)
+            
+            else:
+                # 2. Use global Weaviate client
+                global weaviate_client
+                if weaviate_client is None:
                     weaviate_client = await connect_to_weaviate(WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_GRPC_PORT)
-
-            # 4. Generate embeddings
-            embeddings = create_embeddings(
-                chunks, ml_models['embedding_model'], MODEL_NAME)
-
-            # 5. Create a unique collection name for this request
-            collection_name = f"Policy_{request_id.replace('-', '')[:12]}"
-
-            # 6. Ingest data to Weaviate with connection parameters for potential reconnection
-            weaviate_client = await ingest_to_weaviate(
-                weaviate_client,
-                collection_name,
-                chunks,
-                embeddings,
-                host=WEAVIATE_HOST,
-                port=WEAVIATE_PORT,
-                grpc_port=WEAVIATE_GRPC_PORT
-            )
+                else:
+                    try:
+                        weaviate_client.is_ready()
+                    except weaviate.exceptions.WeaviateClosedClientError:
+                        weaviate_client = await connect_to_weaviate(WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_GRPC_PORT)
+                
+                # 3. Process document with caching (cache check happens here)
+                try:
+                    collection_name, was_cached = await process_document_with_cache(
+                        file_path,
+                        original_source_url,
+                        weaviate_client,
+                        ml_models['embedding_model'],
+                        MODEL_NAME
+                    )
+                except ValueError as ve:
+                    # Handle case where document has no content
+                    log_service_event("document_no_content", str(ve), {
+                        "file_path": file_path,
+                        "request_id": request_id
+                    })
+                    
+                    answers = ["Files Not found"] * len(questions)
+                    processing_time = time.time() - start_time
+                    log_api_response(
+                        endpoint="/api/v1/hackrx/run",
+                        response_data={
+                            "answers_count": len(answers),
+                            "processing_time": processing_time,
+                            "request_id": request_id,
+                            "status_code": 200,
+                            "document_no_content": True
+                        },
+                        duration=processing_time
+                    )
+                    
+                    # Clean up temp file if needed
+                    if is_temp_file and os.path.exists(file_path):
+                        try:
+                            os.unlink(file_path)
+                        except OSError:
+                            pass
+                    
+                    return QueryResponse(answers=answers)
+                
+                # Clean up temp file if needed (after processing/caching)
+                if is_temp_file and os.path.exists(file_path):
+                    try:
+                        os.unlink(file_path)
+                        log_service_event("temp_file_cleanup", "Temporary file cleaned up", {
+                            "temp_path": file_path
+                        })
+                    except OSError as e:
+                        log_error("temp_file_cleanup_failed", {
+                            "temp_path": file_path,
+                            "error": str(e)
+                        })
 
             # 7. Process each question
             answers = []
@@ -598,11 +685,12 @@ async def process_document_and_answer_questions(
                 "answers_count": len(answers),
                 "processing_time": processing_time,
                 "request_id": request_id,
-                "status_code": 200
+                "status_code": 200,
+                "was_cached": was_cached,
+                "cache_hit": was_cached
             },
             duration=processing_time
-        )
-
+        )        
         # Return the answers
         return QueryResponse(answers=answers)
 
@@ -671,6 +759,24 @@ async def clear_weaviate_collections():
         log_error("clear_weaviate_error", {"error": str(e)})
         raise HTTPException(
             status_code=500, detail=f"Failed to clear Weaviate: {e}")
+
+
+@router.get("/cache-stats", response_model=CacheStatsResponse, tags=["Document Cache"])
+async def get_document_cache_statistics():
+    """
+    Get statistics about cached documents in Weaviate.
+    """
+    try:
+        global weaviate_client
+        if weaviate_client is None:
+            weaviate_client = await connect_to_weaviate(WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_GRPC_PORT)
+        
+        stats = await get_cached_document_stats(weaviate_client)
+        return CacheStatsResponse(**stats)
+    except Exception as e:
+        log_error("cache_stats_error", {"error": str(e)})
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get cache statistics: {e}")
 
 # Include the router in the main app
 app.include_router(router)
