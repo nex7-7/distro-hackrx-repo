@@ -433,6 +433,9 @@ async def process_document_and_answer_questions(
     )
 
     start_time = time.time()
+    
+    # Declare global weaviate_client at the start of the function
+    global weaviate_client
 
     try:
         # Extract document URL and questions
@@ -559,7 +562,6 @@ async def process_document_and_answer_questions(
                     collection_name = f"Webpage_{request_id.replace('-', '')[:12]}"
                     
                     # Use global Weaviate client
-                    global weaviate_client
                     if weaviate_client is None:
                         weaviate_client = await connect_to_weaviate(WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_GRPC_PORT)
                     else:
@@ -603,7 +605,6 @@ async def process_document_and_answer_questions(
             
             else:
                 # 2. Use global Weaviate client
-                global weaviate_client
                 if weaviate_client is None:
                     weaviate_client = await connect_to_weaviate(WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_GRPC_PORT)
                 else:
