@@ -1022,13 +1022,13 @@ def handle_zip_file(zip_path: str, source_url: str, current_zip_depth: int = 0) 
                         processable_files_found = True
                     
                     # Process the file
-                    chunks = ingest_from_url(
+                    file_chunks, _ = ingest_from_url(
                         fpath, 
                         _is_recursive=True, 
                         _source_url=source_url,
                         _current_zip_depth=current_zip_depth + 1
                     )
-                    combined.extend(chunks)
+                    combined.extend(file_chunks)
                     
                 except HTTPException as he:
                     # Re-raise HTTP exceptions (these are security violations)
@@ -1072,8 +1072,8 @@ def handle_zip_file(zip_path: str, source_url: str, current_zip_depth: int = 0) 
 # ------------------------------ Main Engine ------------------------------
 
 
-def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_url: Optional[str] = None, _current_zip_depth: int = 0) -> List[str]:
-    """Ingest a document (remote URL or local path) and return list[str] chunks.
+def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_url: Optional[str] = None, _current_zip_depth: int = 0) -> Tuple[List[str], str]:
+    """Ingest a document (remote URL or local path) and return list[str] chunks with source URL.
 
     Implements required steps:
       1. Download file if remote
@@ -1090,7 +1090,7 @@ def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_ur
         _current_zip_depth (int): Current ZIP extraction depth
     
     Returns:
-        List[str]: List of text chunks extracted from the document
+        Tuple[List[str], str]: Tuple of (text chunks, original source URL)
         
     Raises:
         HTTPException: For security violations or processing errors
@@ -1117,14 +1117,15 @@ def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_ur
                     log_service_event("webpage_no_content", "No content extracted from webpage", {
                         "url": url_or_path
                     })
-                    return []
+                
+                    return [], url_or_path                
                 
                 log_service_event("webpage_ingest_complete", "Completed webpage ingestion successfully", {
                     "url": url_or_path,
                     "chunks": len(chunks),
                     "elapsed": time.time() - start
                 })
-                return chunks
+                return chunks, url_or_path
             
             # Not a webpage, continue with file download
             temp_path = _download_to_temp(url_or_path)
@@ -1165,9 +1166,9 @@ def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_ur
                     "zip_depth": _current_zip_depth
                 })
                 # Return empty list to trigger "Files Not found" response
-                return []
+                return [], source_url or original_input
             
-            return chunks
+            return chunks, source_url or original_input
 
         # Step 5: Route to appropriate parser
         parser_func = Parser_Registry.get(ext)
@@ -1178,7 +1179,7 @@ def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_ur
                 "zip_depth": _current_zip_depth
             })
             # Return empty list for unsupported file types
-            return []
+            return [], source_url or original_input
 
         # Step 6: Execute parser and collect chunks
         chunks = parser_func(temp_path, source_url or original_input)
@@ -1192,7 +1193,7 @@ def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_ur
                 "zip_depth": _current_zip_depth
             })
             # Return empty list to trigger "Files Not found" response
-            return []
+            return [], source_url or original_input
         
         log_service_event("ingest_complete", "Completed ingestion successfully", {
             "input": original_input,
@@ -1201,7 +1202,7 @@ def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_ur
             "zip_depth": _current_zip_depth,
             "elapsed": time.time() - start
         })
-        return chunks
+        return chunks, source_url or original_input
         
     except HTTPException:
         # Re-raise HTTP exceptions (security violations, etc.)
@@ -1233,4 +1234,71 @@ def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_ur
                 })
 
 
-__all__ = ["ingest_from_url", "Parser_Registry", "parse_pdf_file"]
+__all__ = ["ingest_from_url", "Parser_Registry", "parse_pdf_file", "download_and_check_file"]
+
+
+def download_and_check_file(url_or_path: str) -> Tuple[str, str, bool]:
+    """
+    Download file (if URL) and perform security checks, but don't parse yet.
+    This allows for early cache checking based on raw file hash.
+    
+    Parameters:
+        url_or_path (str): URL or local file path
+        
+    Returns:
+        Tuple[str, str, bool]: (file_path, original_source_url, is_temp_file)
+        
+    Raises:
+        HTTPException: For security violations or download errors
+    """
+    start = time.time()
+    is_local = os.path.exists(url_or_path)
+    original_source_url = url_or_path if _is_url(url_or_path) else None
+    
+    try:
+        # Step 1: Download or get local path
+        if not is_local and _is_url(url_or_path):
+            is_webpage, response = _is_webpage_url(url_or_path)
+            
+            if is_webpage:
+                # For webpages, we can't do file-based caching, so process immediately
+                log_service_event("webpage_detected", "URL is webpage - cannot use file-based caching", {
+                    "url": url_or_path
+                })
+                # Return special marker for webpage
+                return url_or_path, url_or_path, False
+            
+            # Download file
+            file_path = _download_to_temp(url_or_path)
+            is_temp_file = True
+        else:
+            file_path = url_or_path
+            is_temp_file = False
+        
+        # Step 2: Security checks
+        _check_file_security(file_path, 0)
+        
+        # Step 3: Log the download/check completion
+        log_service_event("file_downloaded_and_checked", "File ready for cache check", {
+            "input": url_or_path,
+            "file_path": file_path,
+            "is_temp_file": is_temp_file,
+            "elapsed_seconds": time.time() - start
+        })
+        
+        return file_path, original_source_url or url_or_path, is_temp_file
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (security violations, etc.)
+        raise
+    except Exception as e:
+        # Log unexpected errors and convert to HTTP exception
+        log_error("download_and_check_failed", {
+            "input": url_or_path,
+            "error": str(e),
+            "error_type": type(e).__name__
+        })
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error during file download/check: {str(e)}"
+        )
