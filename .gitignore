@@ -20,3 +20,10 @@
 .idea
 *.dev
 /extras
+/logs
+/misc
+/downloads
+/temp
+main.ipynb
+master_tester.json
+report_generator.py
