@@ -21,12 +21,25 @@ import time
 import zipfile
 import tempfile
 import requests
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, unquote
 
 from fastapi import HTTPException
 
 from components.utils.logger import log_service_event, log_error
+
+# Try importing BeautifulSoup for webpage scraping
+try:
+    from bs4 import BeautifulSoup
+    _BEAUTIFULSOUP_AVAILABLE = True
+except ImportError:
+    _BEAUTIFULSOUP_AVAILABLE = False
+
+log_service_event(
+    "beautifulsoup_availability",
+    f"BeautifulSoup module {'available' if _BEAUTIFULSOUP_AVAILABLE else 'unavailable'}",
+    {"available": _BEAUTIFULSOUP_AVAILABLE}
+)
 
 # Optional direct import of unstructured partition function; engine degrades gracefully if absent.
 try:  # pragma: no cover
@@ -398,100 +411,74 @@ def parse_pdf_file(file_path: str, source_url: str) -> List[str]:
 
 # --- PPTX Parser using Docling ---
 def parse_pptx_file(file_path: str, source_url: str) -> List[str]:
-    """Parse PPTX file and return list of text chunks using Docling.
-
-    Focuses on extracting text content from slides while noting the presence of images.
     """
+    Parse PPTX file by converting each slide to an image and running EasyOCR (GPU, parallel) for text extraction.
+    Removes Docling and legacy code. Uses unstructured for slide image extraction.
+    """
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    chunks = []
+    start_time = time.time()
     try:
-        from docling.document_converter import DocumentConverter
-    except ImportError:
-        log_error("docling_import_failed", {
-            "file_path": file_path,
-            "error": "Required module not installed (docling). Try: pip install docling docling-core"
-        })
-        # Fall back to the old parser if available
-        try:
-            from pptx import Presentation
-            log_service_event("docling_fallback", "Falling back to python-pptx parser", {
-                "file_path": file_path
+        if not _UNSTRUCTURED_AVAILABLE:
+            log_error("unstructured_unavailable", {
+                "file_path": file_path,
+                "error": "unstructured not installed"
             })
-            return _legacy_parse_pptx_file(file_path, source_url)
-        except ImportError:
             return []
 
-    start_time = time.time()
-    chunks = []
+        # Partition PPTX using unstructured to get slide images
+        elements = _unstructured_partition(filename=file_path, languages=["eng"]) or []
+        slide_images = []
+        for el in elements:
+            if hasattr(el, "image") and el.image is not None:
+                slide_images.append(el.image)
 
-    try:
-        # Use Docling to convert the PPTX file
-        converter = DocumentConverter()
-        result = converter.convert(file_path)
-        document = result.document
-
-        # Get markdown representation
-        markdown_content = document.export_to_markdown()
-
-        # Check if markdown contains image placeholders
-        contains_images = "<!-- image -->" in markdown_content
-        if contains_images:
-            log_service_event("pptx_images_detected", "Images detected in PPTX (text only extraction)", {
-                "file_path": file_path
+        if not slide_images:
+            log_error("pptx_no_images_found", {
+                "file_path": file_path,
+                "error": "No slide images found"
             })
+            return []
 
-        # Split markdown by headings to get slide chunks
-        slide_chunks = []
-        current_slide = []
-        slide_count = 0
-        lines = markdown_content.split('\n')
-        for line in lines:
-            if line.startswith('# ') or line.startswith('## '):
-                if current_slide:
-                    slide_count += 1
-                    slide_text = '\n\n'.join(current_slide)
-                    if not slide_text.startswith('Slide'):
-                        slide_text = f"Slide {slide_count}: {current_slide[0]}\n\n" + slide_text
-                    if "<!-- image -->" in slide_text:
-                        slide_text += "\n\n[Image content not extracted]"
-                    slide_chunks.append(slide_text)
-                    current_slide = []
-            if line.strip():
-                current_slide.append(line)
+        # EasyOCR setup (GPU, all supported languages)
+        import easyocr
+        reader = easyocr.Reader(['en'], gpu=True)  # Using 'en' initially to avoid potential errors with languages_list()
 
-        if current_slide:
-            slide_count += 1
-            slide_text = '\n\n'.join(current_slide)
-            if not slide_text.startswith('Slide'):
-                slide_text = f"Slide {slide_count}: {current_slide[0]}\n\n" + slide_text
-            if "<!-- image -->" in slide_text:
-                slide_text += "\n\n[Image content not extracted]"
-            slide_chunks.append(slide_text)
+        def ocr_image(img):
+            # img is a PIL Image or numpy array
+            import numpy as np
+            if not hasattr(img, 'save'):
+                # If not PIL, convert
+                from PIL import Image
+                img = Image.fromarray(img)
+            # Convert to numpy array for EasyOCR
+            img_np = np.array(img)
+            result = reader.readtext(img_np, detail=0)
+            return '\n'.join(result)
 
-        chunks = slide_chunks
+        # Run OCR in parallel
+        with ThreadPoolExecutor() as executor:
+            future_to_img = {executor.submit(ocr_image, img): idx for idx, img in enumerate(slide_images)}
+            for future in as_completed(future_to_img):
+                text = future.result()
+                if text.strip():
+                    chunks.append(text)
 
+        parsing_time = time.time() - start_time
+        log_service_event("pptx_parsed_with_easyocr", "Parsed PPTX file with EasyOCR (GPU, parallel)", {
+            "file_path": file_path,
+            "source_url": source_url,
+            "slides_processed": len(chunks),
+            "parsing_time_seconds": parsing_time
+        })
+        return chunks
     except Exception as e:
-        log_error("docling_pptx_parse_failed", {
+        log_error("pptx_easyocr_parse_failed", {
             "file_path": file_path,
             "error": str(e)
         })
-        # Fall back to legacy parser
-        try:
-            log_service_event("docling_error_fallback", "Falling back to python-pptx parser after Docling error", {
-                "file_path": file_path,
-                "error": str(e)
-            })
-            return _legacy_parse_pptx_file(file_path, source_url)
-        except Exception:
-            return []
-
-    parsing_time = time.time() - start_time
-    log_service_event("pptx_parsed_with_docling", "Parsed PPTX file with Docling", {
-        "file_path": file_path,
-        "source_url": source_url,
-        "slides_processed": len(chunks),
-        "contains_images": contains_images,
-        "parsing_time_seconds": parsing_time
-    })
-    return chunks
+        return []
 
 
 # Legacy PPTX parser as fallback
@@ -654,6 +641,109 @@ def _check_file_security(file_path: str, current_zip_depth: int = 0) -> bool:
     
     return True
 
+# --- Web Scraping Parser ---
+def parse_webpage(url: str, source_url: str) -> List[str]:
+    """
+    Parse a webpage by scraping its content and extracting all text.
+    Uses a simplified approach similar to fetch_all_text function.
+    
+    Parameters:
+        url (str): URL of the webpage to scrape
+        source_url (str): Original source URL for logging (same as url in this case)
+    
+    Returns:
+        List[str]: List of text chunks extracted from the webpage
+    """
+    import time
+    import requests
+    start_time = time.time()
+    
+    if not _BEAUTIFULSOUP_AVAILABLE:
+        log_error("beautifulsoup_unavailable", {
+            "url": url,
+            "error": "BeautifulSoup not installed. Try: pip install beautifulsoup4"
+        })
+        return []
+    
+    try:
+        # Use requests to get the webpage content
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        
+        # Parse HTML content
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Remove script and style elements
+        for tag in soup(['script', 'style', 'header', 'footer', 'nav']):
+            tag.decompose()
+        
+        # Get all text, collapse extra spaces/newlines
+        text = soup.get_text(separator='\n', strip=True)
+        
+        # Break into chunks of reasonable size (max ~2000 chars)
+        chunks = []
+        paragraphs = text.split('\n\n')
+        
+        current_chunk = []
+        current_length = 0
+        
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+                
+            # If paragraph is very long, split it further
+            if len(para) > 1000:
+                sentences = para.split('. ')
+                current = ""
+                for s in sentences:
+                    if len(current) + len(s) < 1000:
+                        current += s + ". "
+                    else:
+                        if current:
+                            chunks.append(current.strip())
+                        current = s + ". "
+                if current:
+                    chunks.append(current.strip())
+            else:
+                # For smaller paragraphs, group them together
+                if current_length + len(para) > 1000 and current_chunk:
+                    chunks.append("\n\n".join(current_chunk))
+                    current_chunk = []
+                    current_length = 0
+                
+                current_chunk.append(para)
+                current_length += len(para)
+        
+        # Add the last chunk if any
+        if current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+        
+        # Filter short chunks
+        chunks = [chunk for chunk in chunks if len(chunk) > 50]
+        
+        parsing_time = time.time() - start_time
+        log_service_event("webpage_parsed", "Successfully scraped webpage", {
+            "url": url,
+            "chunks": len(chunks),
+            "parsing_time_seconds": parsing_time
+        })
+        return chunks
+        
+    except requests.exceptions.RequestException as e:
+        log_error("webpage_fetch_failed", {
+            "url": url,
+            "error": str(e)
+        })
+        return []
+    except Exception as e:
+        log_error("webpage_parsing_failed", {
+            "url": url,
+            "error": str(e),
+            "error_type": type(e).__name__
+        })
+        return []
+
 # ------------------------------ Parser Registry ------------------------------
 Parser_Registry: Dict[str, Callable[[str, str], List[str]]] = {
     "xlsx": parse_spreadsheet,
@@ -672,6 +762,37 @@ Parser_Registry: Dict[str, Callable[[str, str], List[str]]] = {
 def _is_url(path_or_url: str) -> bool:
     parsed = urlparse(path_or_url)
     return bool(parsed.scheme and parsed.netloc)
+
+def _is_webpage_url(url: str) -> Tuple[bool, requests.Response]:
+    """
+    Check if a URL points to a webpage (HTML) rather than a downloadable file.
+    Makes a HEAD request to check the content type.
+    
+    Parameters:
+        url (str): The URL to check
+        
+    Returns:
+        Tuple[bool, requests.Response]: 
+            - bool: True if it's a webpage, False otherwise
+            - Response: The response object from the HEAD request
+    """
+    try:
+        # Make a HEAD request first to check content type without downloading full content
+        response = requests.head(url, allow_redirects=True, timeout=10)
+        
+        # Some servers don't support HEAD requests, so fall back to GET if needed
+        if response.status_code >= 400:
+            response = requests.get(url, stream=True, timeout=10)
+            
+        content_type = response.headers.get('content-type', '').lower()
+        
+        # Check if it's an HTML page
+        is_webpage = 'text/html' in content_type
+        
+        return is_webpage, response
+    except Exception:
+        # On any error, assume it's not a webpage
+        return False, None
 
 
 def _download_to_temp(url: str) -> str:
@@ -981,8 +1102,31 @@ def ingest_from_url(url_or_path: str, *, _is_recursive: bool = False, _source_ur
     source_url = _source_url or (url_or_path if _is_url(url_or_path) else None)
 
     try:
-        # Step 1: Download file if remote
-        if not is_local:
+        # Step 1: Check if it's a webpage or downloadable file
+        if not is_local and _is_url(url_or_path):
+            is_webpage, response = _is_webpage_url(url_or_path)
+            
+            if is_webpage:
+                # Process as webpage (no download needed)
+                log_service_event("detected_webpage", "URL points to a webpage, processing with web scraper", {
+                    "url": url_or_path
+                })
+                chunks = parse_webpage(url_or_path, url_or_path)
+                
+                if not chunks:
+                    log_service_event("webpage_no_content", "No content extracted from webpage", {
+                        "url": url_or_path
+                    })
+                    return []
+                
+                log_service_event("webpage_ingest_complete", "Completed webpage ingestion successfully", {
+                    "url": url_or_path,
+                    "chunks": len(chunks),
+                    "elapsed": time.time() - start
+                })
+                return chunks
+            
+            # Not a webpage, continue with file download
             temp_path = _download_to_temp(url_or_path)
         else:
             temp_path = url_or_path

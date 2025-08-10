@@ -46,11 +46,10 @@ from components.gemini_api import (
 )
 from components.reranker_utils import diagnose_reranker_model
 
-# Initialize NLTK
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+nltk.data.find('tokenizers/punkt')
+nltk.download('punkt_tab')
+nltk.download('punk')
+
 
 # Load environment variables
 load_dotenv()
@@ -104,7 +103,7 @@ async def lifespan(app: FastAPI):
     log_service_event(
         "model_loading", f"Loading embedding model: {MODEL_NAME}")
     ml_models['embedding_model'] = SentenceTransformer(
-        MODEL_NAME, device='cpu', cache_folder=CACHE_DIR)
+        MODEL_NAME, device='cuda', cache_folder=CACHE_DIR)
     print("✅ Embedding model loaded.")
     log_service_event("model_loaded", f"Embedding model loaded: {MODEL_NAME}")
 
@@ -114,7 +113,7 @@ async def lifespan(app: FastAPI):
         "reranker_loading", f"Loading reranker model: {RERANKER_MODEL_NAME}")
     from sentence_transformers import CrossEncoder
     ml_models['reranker_model'] = CrossEncoder(
-        RERANKER_MODEL_NAME, device='cpu')
+        RERANKER_MODEL_NAME, device='cuda')
     print("✅ Reranker model loaded.")
     log_service_event("reranker_loaded",
                       f"Reranker model loaded: {RERANKER_MODEL_NAME}")
