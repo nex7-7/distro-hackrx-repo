@@ -1,4 +1,4 @@
-# Rag_Baj: Unified RAG Pipeline
+# HacRx-RAG-Pipeline
 
 ## Overview
 
@@ -107,3 +107,10 @@ flowchart TD
 ---
 
 For more details, see the code comments and docstrings in each module.
+
+## Contributors
+
+1. Prabir Kalwani (@PrabirKalwani)
+2. Snehil Sinha (@nex7-7)
+3. Aayush Shah (@aayushshah1)
+4. Parmpara Srivastava
