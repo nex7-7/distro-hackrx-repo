@@ -45,7 +45,7 @@ from components.gemini_api import (
     generate_github_models_response_httpx
 )
 from components.reranker_utils import diagnose_reranker_model
-from components.riddle_solver import solve_riddle
+from components.riddle_solver import solve_riddle, solve_riddle_with_query
 
 nltk.data.find('tokenizers/punkt')
 nltk.download('punkt_tab')
@@ -109,7 +109,7 @@ async def lifespan(app: FastAPI):
     log_service_event(
         "model_loading", f"Loading embedding model: {MODEL_NAME}")
     ml_models['embedding_model'] = SentenceTransformer(
-        MODEL_NAME, device='cuda', cache_folder=CACHE_DIR)
+        MODEL_NAME, device='cpu', cache_folder=CACHE_DIR)
     print("✅ Embedding model loaded.")
     log_service_event("model_loaded", f"Embedding model loaded: {MODEL_NAME}")
 
@@ -119,7 +119,7 @@ async def lifespan(app: FastAPI):
         "reranker_loading", f"Loading reranker model: {RERANKER_MODEL_NAME}")
     from sentence_transformers import CrossEncoder
     ml_models['reranker_model'] = CrossEncoder(
-        RERANKER_MODEL_NAME, device='cuda')
+        RERANKER_MODEL_NAME, device='cpu')
     print("✅ Reranker model loaded.")
     log_service_event("reranker_loaded",
                       f"Reranker model loaded: {RERANKER_MODEL_NAME}")
@@ -423,18 +423,29 @@ async def process_document_and_answer_questions(
         async with httpx.AsyncClient() as http_client:
             # --- Branch: Special Riddle Solver Path ---
             if document_url == SPECIAL_PDF_URL:
-                log_service_event("riddle_solver_triggered", "Special PDF detected; diverting to riddle solver", {
+                log_service_event("riddle_solver_triggered", "Special PDF detected; using agentic approach", {
                     "request_id": request_id,
                     "document_url": document_url,
                     "questions_count": len(questions)
                 })
                 try:
-                    riddle_answer = await solve_riddle(http_client)
-                except Exception as e:
-                    log_error("riddle_solver_failure", {"error": str(e), "request_id": request_id})
-                    riddle_answer = "Failed to retrieve flight number"
+                    # Use the new agentic approach where each user query becomes the objective
+                    answers = []
+                    for question in questions:
+                        riddle_answer = await solve_riddle_with_query(http_client, question)
+                        answers.append(riddle_answer)
 
-                answers = [riddle_answer for _ in questions]
+                except Exception as e:
+                    log_error("riddle_solver_failure", {
+                              "error": str(e), "request_id": request_id})
+                    # Fallback to generic riddle solving if query-based approach fails
+                    try:
+                        riddle_answer = await solve_riddle(http_client)
+                        answers = [riddle_answer for _ in questions]
+                    except Exception as fallback_error:
+                        log_error("riddle_solver_fallback_failure", {
+                                  "error": str(fallback_error), "request_id": request_id})
+                        answers = ["Failed to process riddle"] * len(questions)
 
                 processing_time = time.time() - start_time
                 log_api_response(
@@ -444,7 +455,7 @@ async def process_document_and_answer_questions(
                         "processing_time": processing_time,
                         "request_id": request_id,
                         "status_code": 200,
-                        "riddle_solver": True
+                        "agentic_riddle_solver": True
                     },
                     duration=processing_time
                 )
@@ -462,10 +473,10 @@ async def process_document_and_answer_questions(
                     "detail": he.detail
                 })
                 print(f"❌ Document ingestion failed: {he.detail}")
-                
+
                 # Return "Files Not found" for security violations or processing errors
                 answers = ["Incorrect file type submitted"] * len(questions)
-                
+
                 processing_time = time.time() - start_time
                 log_api_response(
                     endpoint="/api/v1/hackrx/run",
@@ -479,7 +490,7 @@ async def process_document_and_answer_questions(
                     },
                     duration=processing_time
                 )
-                
+
                 return QueryResponse(answers=answers)
 
             # Check if any valid content was found
@@ -489,10 +500,10 @@ async def process_document_and_answer_questions(
                     "request_id": request_id
                 })
                 print("❌ No valid content found in the document.")
-                
+
                 # Return "Files Not found" for all questions
                 answers = ["Files Not found"] * len(questions)
-                
+
                 processing_time = time.time() - start_time
                 log_api_response(
                     endpoint="/api/v1/hackrx/run",
@@ -505,7 +516,7 @@ async def process_document_and_answer_questions(
                     },
                     duration=processing_time
                 )
-                
+
                 return QueryResponse(answers=answers)
 
             # 2. Semantic chunking
@@ -526,10 +537,10 @@ async def process_document_and_answer_questions(
                     "request_id": request_id
                 })
                 print("❌ No valid content found after semantic chunking.")
-                
+
                 # Return "Files Not found" for all questions
                 answers = ["Files Not found"] * len(questions)
-                
+
                 processing_time = time.time() - start_time
                 log_api_response(
                     endpoint="/api/v1/hackrx/run",
@@ -542,7 +553,7 @@ async def process_document_and_answer_questions(
                     },
                     duration=processing_time
                 )
-                
+
                 return QueryResponse(answers=answers)
 
             # 3. Use global Weaviate client or connect if not available

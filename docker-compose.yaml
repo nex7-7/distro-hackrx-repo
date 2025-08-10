@@ -1,5 +1,22 @@
 version: '3.8'
 services:
+  rag-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - ./huggingface_cache:/app/huggingface_cache
+    environment:
+      - WEAVIATE_HOST=weaviate
+      - WEAVIATE_PORT=8080
+      - WEAVIATE_GRPC_PORT=50051
+      - PYTHONPATH=/app
+    depends_on:
+      - weaviate
+    restart: unless-stopped
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
   weaviate:
     command:
       - --host

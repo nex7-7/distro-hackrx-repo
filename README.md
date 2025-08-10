@@ -113,4 +113,4 @@ For more details, see the code comments and docstrings in each module.
 1. Prabir Kalwani (@PrabirKalwani)
 2. Snehil Sinha (@nex7-7)
 3. Aayush Shah (@aayushshah1)
-4. Parmpara Srivastava
+4. Parmpara Srivastava (@parampara272003)
