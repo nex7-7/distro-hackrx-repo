@@ -48,11 +48,12 @@ from components.reranker_utils import diagnose_reranker_model
 from components.agentic_solver import solve_riddle, solve_riddle_with_query
 
 nltk.download('punkt')
+nltk.download('punkt_tab')
 
 
 # Load environment variables
 load_dotenv()
-WEAVIATE_HOST = os.getenv("WEAVIATE_HOST", "weaviate")
+WEAVIATE_HOST = os.getenv("WEAVIATE_HOST", "localhost")
 WEAVIATE_PORT = int(os.getenv("WEAVIATE_PORT", 8080))
 WEAVIATE_GRPC_PORT = int(os.getenv("WEAVIATE_GRPC_PORT", 50051))
 AUTH_TOKEN = os.getenv(

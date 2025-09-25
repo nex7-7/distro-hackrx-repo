@@ -344,7 +344,7 @@ def parse_pdf_file(file_path: str, source_url: str) -> List[str]:
     Mirrors previous parse_pdf_with_pymupdf behaviour to keep identical
     splitting heuristic (paragraphs / long paragraph sentence splitting).
     """
-    import fitz  # PyMuPDF
+    import pymupdf as fitz  # PyMuPDF
     start_time = time.time()
     document_id = str(uuid.uuid4())
     filename = os.path.basename(file_path)
